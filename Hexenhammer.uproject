@@ -29,6 +29,26 @@
 		{
 			"Name": "OnlineSubsystemNull",
 			"Enabled": true
+		},
+		{
+			"Name": "PhysicsControl",
+			"Enabled": true
+		},
+		{
+			"Name": "ControlRigPhysics",
+			"Enabled": true
+		},
+		{
+			"Name": "MetaHuman",
+			"Enabled": true,
+			"SupportedTargetPlatforms": [
+				"Win64",
+				"Linux"
+			]
+		},
+		{
+			"Name": "MetaHumanCharacter",
+			"Enabled": true
 		}
 	]
 }

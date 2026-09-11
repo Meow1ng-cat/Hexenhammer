@@ -50,13 +50,15 @@ protected:
 	UPROPERTY(EditAnywhere, Category="Input")
 	UInputAction* MouseLookAction;
 
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Weapon")
-	AHexenWeapon* ActiveWeapon = nullptr;
-
 	UPROPERTY(EditAnywhere, Category = "Weapon")
 	FName RightWeaponSocket;
 	UPROPERTY(EditAnywhere, Category = "Weapon")
 	FName LeftWeaponSocket;
+
+	public:
+	UPROPERTY(Replicated, BlueprintReadWrite, Category = "Weapon")
+	AHexenWeapon* ActiveWeapon = nullptr;
+
 
 public:
 
@@ -105,7 +107,13 @@ public:
 	FORCEINLINE class UCameraComponent* GetFollowCamera() const { return FollowCamera; }
 
 protected:
-	UFUNCTION(BlueprintCallable)
+	/**
+	 * Spawns and equips WeaponClass, replacing any current weapon. This is a Server RPC: call it from
+	 * any client that owns this pawn (e.g. from input) and it forwards to the server automatically -
+	 * the body only ever actually runs there. Don't gate calls to it behind a manual HasAuthority()
+	 * check on the caller's side; that would just skip the RPC forwarding.
+	 */
+	UFUNCTION(BlueprintCallable, Server, Reliable, Category = "Weapon")
 	void SetActiveWeapon(TSubclassOf<AHexenWeapon> WeaponClass);
 };
 

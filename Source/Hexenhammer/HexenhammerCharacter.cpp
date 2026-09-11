@@ -160,17 +160,17 @@ void AHexenhammerCharacter::DoJumpEnd()
 	StopJumping();
 }
 
-void AHexenhammerCharacter::SetActiveWeapon(TSubclassOf<AHexenWeapon> WeaponClass)
+void AHexenhammerCharacter::SetActiveWeapon_Implementation(TSubclassOf<AHexenWeapon> WeaponClass)
 {
-	if (!HasAuthority())
-		return;
+	// Server RPC body - this only ever runs on the server, no HasAuthority() check needed here.
 
-	/*TSubclassOf<AHexenWeapon> ClassToSpawn = WeaponClass ? WeaponClass : DefaultWeaponClass;
-	if (!ClassToSpawn)
+	if (!WeaponClass)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("No weapon class to spawn!"));
+		// AHexenWeapon isn't Abstract, so SpawnActor<AHexenWeapon>(nullptr, ...) would silently spawn a
+		// bare base-class weapon (no mesh, no per-weapon Blueprint setup) instead of failing loudly.
+		UE_LOG(LogTemp, Warning, TEXT("SetActiveWeapon: no weapon class given, ignoring."));
 		return;
-	}*/
+	}
 
 	if (ActiveWeapon)
 	{
@@ -196,6 +196,18 @@ void AHexenhammerCharacter::SetActiveWeapon(TSubclassOf<AHexenWeapon> WeaponClas
 
 	if (USkeletalMeshComponent* SkeletalMesh = GetMesh())
 	{
+		// AttachToComponent with an empty/nonexistent socket name doesn't fail - it just attaches at the
+		// mesh component's own origin instead of the hand, which reads as "spawned but not attached
+		// properly". Log clearly instead of leaving that to be a silent mystery.
+		if (RightWeaponSocket.IsNone())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("SetActiveWeapon: RightWeaponSocket is not set on %s - weapon will attach at the mesh's origin, not a hand socket."), *GetName());
+		}
+		else if (!SkeletalMesh->DoesSocketExist(RightWeaponSocket))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("SetActiveWeapon: socket '%s' does not exist on %s's mesh - weapon will attach at the mesh's origin instead."), *RightWeaponSocket.ToString(), *GetName());
+		}
+
 		NewWeapon->AttachToComponent(SkeletalMesh, FAttachmentTransformRules::SnapToTargetIncludingScale, RightWeaponSocket);
 		NewWeapon->SetSocket(RightWeaponSocket);
 	}

@@ -11,21 +11,9 @@ UBodyCollisionComponent::UBodyCollisionComponent()
 void UBodyCollisionComponent::BeginPlay()
 {
 	Super::BeginPlay();
-
-	if (GetOwner()->HasAuthority() && CollisionObject)
-	{
-		CollisionObject->OnComponentBeginOverlap.AddDynamic(this, &UBodyCollisionComponent::OnHexenBeginOverlap);
-	}
-}
-
-void UBodyCollisionComponent::OnHexenBeginOverlap(UPrimitiveComponent* HitComp, AActor* OtherActor,
-	UPrimitiveComponent* OtherComp, int32 OtherBodyIndex,
-	bool bFromSweep, const FHitResult& HitResult)
-{
-	if (GetOwner()->HasAuthority())
-	{
-	}
-
+	// Nothing else to do here - this is a passive hitbox, see header comment. It never calls
+	// StartTrace(), so UHexenCollisionComponent::TickComponent never sweeps it; it's only ever
+	// found as the *target* of a weapon's sweep, in UWeaponCollisionComponent::OnHexenHit.
 }
 
 void UBodyCollisionComponent::HandleDamage(const EDamageType DamageType)
@@ -49,16 +37,16 @@ void UBodyCollisionComponent::HandleDamage(const EDamageType DamageType)
 		break;
 	}
 
-	if (!IsAlive) 
+	if (!IsAlive)
 	{
-		if (IsVital) 
+		if (IsVital)
 		{
 			//make characted dead
 		}
 	}
 }
 
-void  UBodyCollisionComponent::ApplyBleeding() 
+void  UBodyCollisionComponent::ApplyBleeding()
 {
 }
 
@@ -73,5 +61,3 @@ void  UBodyCollisionComponent::ApplyBurning()
 void  UBodyCollisionComponent::ApplyFreezing()
 {
 }
-
-

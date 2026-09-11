@@ -11,6 +11,11 @@
 #include "HexenUtils.h"
 #include "BodyCollisionComponent.generated.h"
 
+/**
+ * A hitbox on a character. Purely a passive target: it never traces itself (bIsTracing stays
+ * false), it's found by the attacking UWeaponCollisionComponent's own sweep instead. See
+ * UWeaponCollisionComponent::ResolveBodyHit for the actual damage decision.
+ */
 UCLASS( ClassGroup=(Custom), meta=(BlueprintSpawnableComponent) )
 class UBodyCollisionComponent : public UHexenCollisionComponent
 {
@@ -18,11 +23,11 @@ class UBodyCollisionComponent : public UHexenCollisionComponent
 
 public:
     UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "DamageCollision")
-    int32 Hardness = 1.f;
+    float Hardness = 1.f;
     UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "DamageCollision")
-    int32 Resilience = 50.f; //Resistance to Cutting. If HitPircing < Resilience, hit is not valid.
+    float Resilience = 50.f; //Resistance to Cutting. If HitPircing < Resilience, hit is not valid.
     UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "DamageCollision")
-    int32 Durabulity = 50.f; //Resistance to Mauling. Bone breaking stacks count as Damage by Mauling/Durabulity
+    float Durabulity = 50.f; //Resistance to Mauling. Bone breaking stacks count as Damage by Mauling/Durabulity
 
     UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "BodyType")
     bool IsAlive = true;
@@ -34,16 +39,12 @@ public:
 
 public:
     UBodyCollisionComponent();
-    //virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
     UFUNCTION(BlueprintCallable, Category = "Damage")
     void HandleDamage(const EDamageType DamageType);
 
 protected:
     virtual void BeginPlay() override;
-    void OnHexenBeginOverlap(UPrimitiveComponent* HitComp, AActor* OtherActor,
-        UPrimitiveComponent* OtherComp, int32 OtherBodyIndex,
-        bool bFromSweep, const FHitResult& HitResult) override;
 
     virtual void ApplyBleeding();
     virtual void ApplyBoneBreak();
