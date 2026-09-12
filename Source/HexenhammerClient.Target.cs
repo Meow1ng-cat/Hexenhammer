@@ -8,8 +8,8 @@ public class HexenhammerClientTarget : TargetRules
 	public HexenhammerClientTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Client;
-		DefaultBuildSettings = BuildSettingsVersion.V6;
-		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_7;
+		DefaultBuildSettings = BuildSettingsVersion.V7;
+		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_8;
 		ExtraModuleNames.Add("Hexenhammer");
         bUseLoggingInShipping = true;//Для дебага не забыть удалить
     }
