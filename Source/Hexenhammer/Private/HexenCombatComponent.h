@@ -4,11 +4,55 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "HAL/CriticalSection.h"
 #include "HexenCombatComponent.generated.h"
 
 class UHexenCollisionComponent;
 class USkeletalMeshComponent;
 class UAnimMontage;
+
+/** What the rig's Hexen Blade Guard needs each frame - see UHexenCombatComponent::bUseBladeGuard. */
+struct FHexenBladeGuardInput
+{
+	/** This blade's capsule axis in the hand bone's frame - the one frame it does not move in. */
+	FVector MyAxisStartInHand = FVector::ZeroVector;
+	FVector MyAxisEndInHand = FVector::ZeroVector;
+	float MyRadius = 0.f;
+
+	/** The partner's capsule axis in the world, where the partner's animation put it: its drawn pose minus the correction its own guard added. */
+	FVector PartnerAxisStartWorld = FVector::ZeroVector;
+	FVector PartnerAxisEndWorld = FVector::ZeroVector;
+	float PartnerRadius = 0.f;
+
+	float Share = 0.5f;
+	float Skin = 0.f;
+
+	/**
+	 * The direction to push this blade in, in the world. One decision for the pair, the same for both
+	 * fighters with opposite signs - see UHexenCombatComponent::UpdateBladeGuard.
+	 */
+	FVector PairAxisWorld = FVector::ZeroVector;
+
+	/** The pair's blades have been carried through one another, and the push has to take them back rather than on. */
+	bool bPairCrossed = false;
+
+	/** A blade further past the other than this, in cm, is let go rather than hauled back. */
+	float MaxPushBack = 0.f;
+};
+
+/** What the guard did in the last evaluation. */
+struct FHexenBladeGuardResult
+{
+	bool bPenetrating = false;
+
+	/** The animation had carried the blade through the partner's, and the guard sent it back to its own side. */
+	bool bCrossed = false;
+
+	float Depth = 0.f;
+	FVector NormalWorld = FVector::ZeroVector;
+	FVector ContactPointWorld = FVector::ZeroVector;
+	FVector CorrectionWorld = FVector::ZeroVector;
+};
 
 /**
  * One per fighter. Collects what all of that fighter's collision volumes report, and turns it into the
@@ -64,6 +108,21 @@ public:
      */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat", meta = (ClampMin = "0.01", ClampMax = "0.9"))
     float ContactReachedFraction = 0.25f;
+
+    /**
+     * How many frames in a row the gap may stop closing before the ratchet steps anyway.
+     *
+     * Arriving within ContactReachedFraction of the target is the clean case, but the solver does not always
+     * get there: it can settle a few centimetres short and stay, and then "arrived" never comes and the
+     * ratchet never takes its second step. A gap that has stopped closing for this many frames means the
+     * solver has done what it will at this target, so the target moves on regardless.
+     *
+     * Keeps the guard the arrival rule was there for: the target still only moves once the arm has stopped
+     * catching up, so a hand that cannot follow at all walks the target out one step per this many frames
+     * rather than one per frame.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat", meta = (ClampMin = "1"))
+    int32 ContactStallFrames = 3;
 
     /**
      * How fast the blend lets go once the blades have come apart, as an FInterpTo speed.
@@ -180,6 +239,106 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
     bool bPauseMontageOnContact = true;
 
+    /**
+     * Whether a contact also holds the whole pose still, montage or not.
+     *
+     * The montage pause only covers swings that are montages, and most binds are held from a stance or on
+     * the move, with no montage playing. Then the pose kept animating underneath - on each machine at its
+     * own phase - so the blade a client drew sat on average 7 cm (up to 46) from where the server had it,
+     * and the server's target hung beside the client's blade instead of on it.
+     *
+     * The freeze is a pose snapshot taken when this machine learns of the contact. The AnimGraph shows it
+     * while bContactPoseFrozen is set, and the blade IK keeps solving on top of it.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
+    bool bFreezePoseOnContact = true;
+
+    /** The name the frozen pose is saved under. The Pose Snapshot node in the AnimGraph must use the same one. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Combat")
+    FName ContactPoseSnapshotName = FName("ContactFreeze");
+
+    /** True while the snapshot holds the pose. Drive the AnimGraph's Blend Poses by bool with this. */
+    UPROPERTY(BlueprintReadOnly, Category = "Combat")
+    bool bContactPoseFrozen = false;
+
+    /**
+     * Keep the blade out of the other fighter's with the rig's Hexen Blade Guard instead of the ratchet.
+     *
+     * The guard works like a solid surface rather than a target: every frame it looks at where the
+     * animation wants the blade and moves it only if that would put it into the other blade, by exactly the
+     * overlap. It can push, never pull, and it keeps nothing from one frame to the next - so there is no
+     * target to hold the blade after the contact and no release to wait out.
+     *
+     * While on, the ratchet, the montage pause and the pose freeze all stand down. Stopping the animation
+     * would hold the blades pressed together with nothing left that could part them: the guard only ever
+     * lets go when the animation takes the blade away.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard")
+    bool bUseBladeGuard = true;
+
+    /** This fighter's part of an overlap, 0..1. Two fighters at a half each resolve it exactly between them. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0", ClampMax = "1"))
+    float BladeGuardShare = 0.5f;
+
+    /**
+     * How far inside touching, in cm, the guard leaves the two capsules.
+     *
+     * Exactly touching is exactly the boundary of the overlap that says the blades are in contact, and a
+     * boundary flickers. A little inside keeps that overlap on for as long as the blades are pressed
+     * together, and it ends when the animation takes them apart.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0"))
+    float BladeGuardSkin = 1.f;
+
+    /** How far away, in cm, another fighter's blade is still looked at. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0"))
+    float BladeGuardRange = 300.f;
+
+    /**
+     * How long, in seconds, the swing stays stopped once the guard first pushes. Needs bPauseMontageOnContact.
+     *
+     * The guard only pushes back; a strike keeps coming. Two frames after first touch the animation had the
+     * hand 75 cm past the other blade - more than the arm can be pulled back by, and far enough that the
+     * crossing is no longer recognisable. A solid blade would simply have stopped it. A fixed time is a
+     * stand-in for what should really let go - the fighter's next action.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0"))
+    float BladeGuardPauseSeconds = 0.5f;
+
+    /**
+     * How far past the other blade, in cm, a blade can have been carried and still be brought back.
+     *
+     * Beyond it the guard lets go. No blade could have been held back from there, and hauling the arm that
+     * far reads as the arm being yanked rather than the blade being stopped.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0"))
+    float BladeGuardMaxPushBack = 40.f;
+
+    /**
+     * How finely the last frame's movement of a pair of blades is searched for the moment they met.
+     *
+     * A strike can carry a blade right through the other between two frames - at 19 fps a cut covers more
+     * than both capsules' width in one - and then neither frame's pose shows a contact at all, only "before"
+     * and "already through". The sweep finds the moment in between, and the swing is rewound to it.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "1", ClampMax = "64"))
+    int32 BladeGuardSweepSteps = 12;
+
+    /** The combat component of the fighter a rig is running for. Safe to call from the animation worker threads. */
+    static UHexenCombatComponent* FindForActor(const AActor* Actor);
+
+    /** For the rig. Worker-thread safe. False when the guard is off or no other blade is in range. */
+    bool GetBladeGuardInput(FHexenBladeGuardInput& Out) const;
+
+    /** For the rig. Worker-thread safe. */
+    void SetBladeGuardResult(const FHexenBladeGuardResult& In);
+
+    /** The correction the guard added in the last evaluation, in world space - what a partner takes off this blade to see where the animation had it. */
+    FVector GetBladeGuardCorrectionWorld() const;
+
+    /** The hand the weapon is held in, as drawn, in world space. Game thread. */
+    bool GetHandTransformWorld(FTransform& Out) const;
+
     /** Called by a collision volume whenever its own contact state changes. Adding twice or removing something that was never added are both harmless. */
     void SetVolumeContact(UHexenCollisionComponent* Volume, bool bVolumeInContact, const FVector& WorldContactPoint);
 
@@ -193,6 +352,35 @@ protected:
 
     /** Releases the pause this component placed, if it placed one. Safe to call at any time. */
     void ResumePausedMontage();
+
+    /** Pauses whatever montage is playing and remembers it. Logs when there is none to pause. */
+    void PauseCurrentMontage();
+
+    /** Winds the playing montage back to Alpha of the way through the last frame, where the sweep found the blades meeting, and pauses it there. */
+    void RewindSwingToTouch(float Alpha);
+
+    /** Snapshots the pose when the fighter becomes engaged and lets it go when they come clear. Follows ContactCount. */
+    void UpdatePoseFreeze();
+
+    /** Game thread, every frame while the guard is on: finds this fighter's blade and the nearest other one, and publishes what the rig needs. */
+    void UpdateBladeGuard();
+
+    /** Shared with the rig, which runs on an animation worker thread. */
+    mutable FCriticalSection BladeGuardLock;
+    FHexenBladeGuardInput BladeGuardInput;
+    bool bBladeGuardInputValid = false;
+    FHexenBladeGuardResult BladeGuardResult;
+
+    /** Whether the guard was pushing on the last tick, so the log can say when it starts and stops. */
+    bool bGuardWasPushing = false;
+
+
+    /** When the guard stopped the swing - see BladeGuardPauseSeconds. */
+    double GuardPauseStartTime = 0.0;
+
+    /** The montage that was playing on the last tick, and where it was - where a rewind winds back towards. */
+    TWeakObjectPtr<UAnimMontage> LastSwingMontage;
+    float LastSwingPosition = 0.f;
 
     /**
      * The exact montage this component paused.
@@ -215,8 +403,21 @@ protected:
     /** Puts the target one step further along the current way out. Asks the volume for the direction every time, because two blades in a bind slide and the way out moves with them. */
     void StepTarget(const FVector& FromWorld);
 
-    /** Which part of the blade was touched, in HandBoneName's local space. The one thing held across the whole bind. */
+    /**
+     * Which part of the blade was touched, in HandBoneName's local space. The one thing held across the whole bind.
+     *
+     * Blueprint-readable so the rig can place its effector bone in the hand's own frame - the one frame in which
+     * this spot does not move, whatever pose the arm happens to be in. Set on every machine when a bind begins;
+     * not replicated, for the same reason ContactBindId is not.
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "Combat")
     FVector ContactHandOffset = FVector::ZeroVector;
+
+    /** The gap as it stood last frame, to tell whether it is still closing. */
+    float PreviousGapDistance = 0.f;
+
+    /** Frames in a row in which the gap has failed to close by at least the arrival tolerance. */
+    int32 StalledFrames = 0;
 
     /** The volume holding this contact - asked for the separation direction on every step. */
     TWeakObjectPtr<UHexenCollisionComponent> ContactVolume;

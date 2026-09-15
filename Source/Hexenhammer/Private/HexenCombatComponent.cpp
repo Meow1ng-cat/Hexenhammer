@@ -10,6 +10,234 @@
 #include "Net/UnrealNetwork.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
+#include "Misc/ScopeLock.h"
+
+namespace
+{
+	/**
+	 * Which combat component belongs to which fighter, for the rig. A rig unit knows the actor it is running
+	 * for and nothing else, runs on a worker thread, and must not go searching an actor's components there.
+	 */
+	FCriticalSection GCombatRegistryLock;
+	TMap<const AActor*, TWeakObjectPtr<UHexenCombatComponent>> GCombatRegistry;
+
+	/**
+	 * One record per pair of blades in range of each other: which way apart they are, and whether they have
+	 * been carried through one another. Keyed by the two volumes in address order, so both fighters of a
+	 * pair land on the same record. Game thread only.
+	 */
+	struct FHexenBladePair
+	{
+		TWeakObjectPtr<UHexenCollisionComponent> First;
+		TWeakObjectPtr<UHexenCollisionComponent> Second;
+
+		/** Pointing from Second towards First. */
+		FVector Side = FVector::ZeroVector;
+
+		bool bCrossed = false;
+
+		/** The frame the record was last decided in, so the second fighter of the pair reads it rather than deciding again. */
+		uint64 Frame = 0;
+
+		/** Both blades' animated hands last frame, for the sweep - each blade is rebuilt from its hand. */
+		bool bHasPrevious = false;
+		FTransform PrevFirstHand = FTransform::Identity;
+		FTransform PrevSecondHand = FTransform::Identity;
+
+		/** The frame in which the sweep found the blades meeting between two poses, and how far through the last frame they met. */
+		uint64 TouchFrame = 0;
+		float TouchAlpha = 0.f;
+	};
+
+	TMap<TPair<const UHexenCollisionComponent*, const UHexenCollisionComponent*>, FHexenBladePair> GBladePairs;
+
+	/** A blade where its animation had it - as drawn, minus what its own guard added on top - with the hand that holds it. */
+	struct FAnimatedBlade
+	{
+		FVector Start = FVector::ZeroVector;
+		FVector End = FVector::ZeroVector;
+		float Radius = 0.f;
+
+		/** The hand, where the animation had it. */
+		FTransform Hand = FTransform::Identity;
+
+		/** The axis in the hand's frame - fixed, since the grip does not change. */
+		FVector LocalStart = FVector::ZeroVector;
+		FVector LocalEnd = FVector::ZeroVector;
+	};
+
+	bool GetAnimatedBlade(UHexenCollisionComponent* Blade, FAnimatedBlade& Out)
+	{
+		UHexenCombatComponent* Fighter = Blade ? Blade->GetFighter() : nullptr;
+		FTransform DrawnHand;
+		if (!Fighter || !Fighter->GetHandTransformWorld(DrawnHand) || !Blade->GetShapeAxisWorld(Out.Start, Out.End, Out.Radius))
+		{
+			return false;
+		}
+
+		Out.LocalStart = DrawnHand.InverseTransformPosition(Out.Start);
+		Out.LocalEnd = DrawnHand.InverseTransformPosition(Out.End);
+
+		// The guard moves the hand by a translation, so taking it off again is a translation too.
+		const FVector Correction = Fighter->GetBladeGuardCorrectionWorld();
+		Out.Hand = DrawnHand;
+		Out.Hand.AddToTranslation(-Correction);
+		Out.Start -= Correction;
+		Out.End -= Correction;
+		return true;
+	}
+
+	/** Whether Point lies along the body of the segment rather than at one of its ends. */
+	bool IsOnBody(const FVector& Point, const FVector& Start, const FVector& End)
+	{
+		const FVector Axis = End - Start;
+		const double LengthSq = Axis.SizeSquared();
+		if (LengthSq <= UE_KINDA_SMALL_NUMBER)
+		{
+			return true;
+		}
+		const double T = FVector::DotProduct(Point - Start, Axis) / LengthSq;
+		return T > 0.001 && T < 0.999;
+	}
+
+	/**
+	 * Decides, once per frame, which way apart the pair is and whether its blades have been carried through
+	 * one another - from where both animations had the blades, so the two fighters' corrections do not feed
+	 * back into it.
+	 */
+	const FHexenBladePair& UpdateBladePair(UHexenCollisionComponent* A, UHexenCollisionComponent* B, float MaxPushBack, float Skin, int32 SweepSteps)
+	{
+		for (auto It = GBladePairs.CreateIterator(); It; ++It)
+		{
+			if (!It.Value().First.IsValid() || !It.Value().Second.IsValid())
+			{
+				It.RemoveCurrent();
+			}
+		}
+
+		UHexenCollisionComponent* First = A < B ? A : B;
+		UHexenCollisionComponent* Second = A < B ? B : A;
+		FHexenBladePair& Pair = GBladePairs.FindOrAdd(MakeTuple(static_cast<const UHexenCollisionComponent*>(First), static_cast<const UHexenCollisionComponent*>(Second)));
+
+		// The other fighter of the pair has already decided this frame.
+		if (Pair.Frame == GFrameCounter)
+		{
+			return Pair;
+		}
+		Pair.First = First;
+		Pair.Second = Second;
+		Pair.Frame = GFrameCounter;
+
+		FAnimatedBlade FirstBlade, SecondBlade;
+		if (!GetAnimatedBlade(First, FirstBlade) || !GetAnimatedBlade(Second, SecondBlade))
+		{
+			return Pair;
+		}
+		const FVector& FirstStart = FirstBlade.Start;
+		const FVector& FirstEnd = FirstBlade.End;
+		const FVector& SecondStart = SecondBlade.Start;
+		const FVector& SecondEnd = SecondBlade.End;
+		const float FirstRadius = FirstBlade.Radius;
+		const float SecondRadius = SecondBlade.Radius;
+
+		FVector OnFirst, OnSecond;
+		FMath::SegmentDistToSegmentSafe(FirstStart, FirstEnd, SecondStart, SecondEnd, OnFirst, OnSecond);
+		FVector Normal = (OnFirst - OnSecond).GetSafeNormal();
+		if (Normal.IsNearlyZero())
+		{
+			Normal = ((FirstStart + FirstEnd) - (SecondStart + SecondEnd)).GetSafeNormal();
+		}
+		if (Normal.IsNearlyZero())
+		{
+			return Pair;
+		}
+
+		// The sweep: where between last frame and this one the two first came within reach of each other. Only
+		// when they were apart last frame - inside a contact the guard already holds them.
+		//
+		// Each blade is carried between its two poses by its hand - position in a straight line, rotation along
+		// the shortest arc - and rebuilt from the hand as it is fixed to it. A strike turns the blade about the
+		// hand; moving the blade's two ends in straight lines instead cut inside the arc the tip really follows,
+		// so the meeting came out late and the swing was not wound back far enough.
+		bool bSweptTouch = false;
+		const float Reach = FirstRadius + SecondRadius - Skin;
+		if (Pair.bHasPrevious)
+		{
+			auto BladeAt = [](const FTransform& Hand, const FAnimatedBlade& Blade, FVector& OutStart, FVector& OutEnd)
+			{
+				OutStart = Hand.TransformPosition(Blade.LocalStart);
+				OutEnd = Hand.TransformPosition(Blade.LocalEnd);
+			};
+
+			FVector WasFirstStart, WasFirstEnd, WasSecondStart, WasSecondEnd, WasOnFirst, WasOnSecond;
+			BladeAt(Pair.PrevFirstHand, FirstBlade, WasFirstStart, WasFirstEnd);
+			BladeAt(Pair.PrevSecondHand, SecondBlade, WasSecondStart, WasSecondEnd);
+			FMath::SegmentDistToSegmentSafe(WasFirstStart, WasFirstEnd, WasSecondStart, WasSecondEnd, WasOnFirst, WasOnSecond);
+			if (FVector::Dist(WasOnFirst, WasOnSecond) >= Reach)
+			{
+				const int32 Steps = FMath::Max(1, SweepSteps);
+				for (int32 Step = 1; Step <= Steps; ++Step)
+				{
+					const float Alpha = static_cast<float>(Step) / Steps;
+					FTransform FirstHand, SecondHand;
+					FirstHand.Blend(Pair.PrevFirstHand, FirstBlade.Hand, Alpha);
+					SecondHand.Blend(Pair.PrevSecondHand, SecondBlade.Hand, Alpha);
+
+					FVector StepFirstStart, StepFirstEnd, StepSecondStart, StepSecondEnd, StepOnFirst, StepOnSecond;
+					BladeAt(FirstHand, FirstBlade, StepFirstStart, StepFirstEnd);
+					BladeAt(SecondHand, SecondBlade, StepSecondStart, StepSecondEnd);
+					FMath::SegmentDistToSegmentSafe(StepFirstStart, StepFirstEnd, StepSecondStart, StepSecondEnd, StepOnFirst, StepOnSecond);
+					if (FVector::Dist(StepOnFirst, StepOnSecond) < Reach)
+					{
+						// The last step at which they were still apart - rewinding to it leaves the blades just short
+						// of touching rather than just inside.
+						bSweptTouch = true;
+						Pair.TouchFrame = GFrameCounter;
+						Pair.TouchAlpha = static_cast<float>(Step - 1) / Steps;
+						break;
+					}
+				}
+			}
+		}
+		Pair.PrevFirstHand = FirstBlade.Hand;
+		Pair.PrevSecondHand = SecondBlade.Hand;
+		Pair.bHasPrevious = true;
+
+		if (Pair.Side.IsNearlyZero())
+		{
+			Pair.Side = Normal;
+			Pair.bCrossed = false;
+			return Pair;
+		}
+
+		const bool bFlipped = FVector::DotProduct(Normal, Pair.Side) < 0.f;
+		if (Pair.bCrossed)
+		{
+			// Stays crossed until the animations bring the blades back to their own sides - or have carried
+			// them so far through that no blade could have been held back from there.
+			const float PastBy = -FVector::DotProduct(OnFirst - OnSecond, Pair.Side);
+			if (!bFlipped || PastBy > MaxPushBack)
+			{
+				Pair.bCrossed = false;
+				Pair.Side = Normal;
+			}
+		}
+		else if (bFlipped && (bSweptTouch || (IsOnBody(OnFirst, FirstStart, FirstEnd) && IsOnBody(OnSecond, SecondStart, SecondEnd))))
+		{
+			// Turned past a right angle in one frame, and either the sweep saw them meet on the way or each
+			// blade's closest point is on the other's body: not a blade sliding along, and not one going round
+			// a tip - the animations carried them through.
+			Pair.bCrossed = true;
+		}
+		else
+		{
+			// Still on the same sides, or legitimately round a tip: the direction follows the blades.
+			Pair.Side = Normal;
+		}
+
+		return Pair;
+	}
+}
 
 UHexenCombatComponent::UHexenCombatComponent()
 {
@@ -54,10 +282,27 @@ void UHexenCombatComponent::BeginPlay()
 			*GetName(), *GetNameSafe(GetOwner()));
 	}
 #endif
+
+	{
+		FScopeLock Lock(&GCombatRegistryLock);
+		GCombatRegistry.Add(GetOwner(), this);
+	}
+
+	// The guard needs the two blades' poses every frame, touching or not - it is the rig that decides
+	// whether they touch.
+	if (bUseBladeGuard)
+	{
+		SetComponentTickEnabled(true);
+	}
 }
 
 void UHexenCombatComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	{
+		FScopeLock Lock(&GCombatRegistryLock);
+		GCombatRegistry.Remove(GetOwner());
+	}
+
 	// A fighter removed mid-contact would otherwise leave its montage paused with nothing left that
 	// could ever resume it.
 	ResumePausedMontage();
@@ -110,6 +355,8 @@ void UHexenCombatComponent::BeginContact(UHexenCollisionComponent* Volume, const
 
 	ContactVolume = Volume;
 	ContactStepsTaken = 0;
+	StalledFrames = 0;
+	PreviousGapDistance = TNumericLimits<float>::Max();
 	++ContactBindId;
 
 	// The one thing held for the whole bind: which part of the blade was touched. Kept in the hand's
@@ -130,7 +377,7 @@ void UHexenCombatComponent::BeginContact(UHexenCollisionComponent* Volume, const
 	}
 #endif
 
-	if (GetOwner() && GetOwner()->HasAuthority())
+	if (GetOwner() && GetOwner()->HasAuthority() && !bUseBladeGuard)
 	{
 		StepTarget(WorldContactPoint);
 	}
@@ -198,6 +445,14 @@ void UHexenCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
+	if (bUseBladeGuard)
+	{
+		// The rig decides from the animated pose every frame; there is no target to chase and no blend to ease.
+		ContactBlendAlpha = 1.f;
+		UpdateBladeGuard();
+		return;
+	}
+
 	const USkeletalMeshComponent* Mesh = GetOwnerMesh();
 	if (!Mesh)
 	{
@@ -223,11 +478,31 @@ void UHexenCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 
 	// Where the touched part of the blade has got to, rebuilt from the hand. This is what the solver is
 	// moving, so this is what has to be measured against the target.
-	const FVector PointWorld = Mesh->GetSocketTransform(HandBoneName, RTS_World).TransformPosition(ContactHandOffset);
+	const FTransform HandTM = Mesh->GetSocketTransform(HandBoneName, RTS_World);
+	const FVector PointWorld = HandTM.TransformPosition(ContactHandOffset);
 	const FVector TargetWorld = ComponentToWorld.TransformPosition(ContactTarget);
 
 	ContactPoint = ComponentToWorld.InverseTransformPosition(PointWorld);
 	ContactGapDistance = (TargetWorld - PointWorld).Size();
+
+#if !UE_BUILD_SHIPPING
+	if (bLogContactSteps && ContactCount > 0)
+	{
+		// One line per frame while touching. The step lines only show that the ratchet stalled; this shows by
+		// how much and on which machine. A gap that hovers around one step says the rig is aiming at the wrong
+		// spot on the blade; a gap of tens of centimetres says it is not moving the blade at all.
+		// Where the target sits as seen from the hand, minus where the touched spot sits in the hand: the move,
+		// in the hand's own frame, that would still put the spot on the target. A vector that comes out the same
+		// bind after bind says a different point of the blade is being placed on the target - a fixed offset
+		// between two frames of reference, not the solver falling short.
+		const FVector HandErr = HandTM.InverseTransformPosition(TargetWorld) - ContactHandOffset;
+		UE_LOG(LogTemp, Warning, TEXT("[BIND] %s tick f%llu %s | gap %.2fcm | point %s | target %s | alpha %.2f | steps %d | handErr %s (%.2fcm)"),
+			*GetNameSafe(GetOwner()), (unsigned long long)GFrameCounter,
+			(GetOwner() && GetOwner()->HasAuthority()) ? TEXT("srv") : TEXT("cli"),
+			ContactGapDistance, *ContactPoint.ToCompactString(), *ContactTarget.ToCompactString(),
+			ContactBlendAlpha, ContactStepsTaken, *HandErr.ToCompactString(), HandErr.Size());
+	}
+#endif
 
 	// Arrived, so push the target one step further out. The blades come apart once enough of these have
 	// accumulated, and the overlap ending is what stops it. Nothing here counts centimetres of overlap,
@@ -237,10 +512,31 @@ void UHexenCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 	// would keep shoving a blade that has nothing left to push against.
 	// And only on the server. Every machine measures the gap - the client needs it to draw and to know
 	// where its own blade is - but only one of them may decide that it is time to push further.
-	if (ContactCount > 0 && GetOwner() && GetOwner()->HasAuthority()
-		&& ContactGapDistance <= ContactStep * ContactReachedFraction)
+	if (ContactCount > 0 && GetOwner() && GetOwner()->HasAuthority())
 	{
-		StepTarget(PointWorld);
+		const float Tolerance = ContactStep * ContactReachedFraction;
+
+		// Arrived is the clean case. Stalled is the one the solver actually produces: it settles a few
+		// centimetres short of the target and stays there, so "arrived" never comes. A gap that has stopped
+		// closing for ContactStallFrames frames means the solver has done what it will at this target.
+		StalledFrames = (PreviousGapDistance - ContactGapDistance < Tolerance) ? StalledFrames + 1 : 0;
+		PreviousGapDistance = ContactGapDistance;
+
+		const bool bArrived = ContactGapDistance <= Tolerance;
+		const bool bStalled = StalledFrames >= ContactStallFrames;
+		if (bArrived || bStalled)
+		{
+#if !UE_BUILD_SHIPPING
+			if (bLogContactSteps && !bArrived)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[BIND] %s stalled %d frame(s) at gap %.2fcm - stepping on"),
+					*GetNameSafe(GetOwner()), StalledFrames, ContactGapDistance);
+			}
+#endif
+			StepTarget(PointWorld);
+			StalledFrames = 0;
+			PreviousGapDistance = TNumericLimits<float>::Max();
+		}
 	}
 
 #if !UE_BUILD_SHIPPING
@@ -282,6 +578,7 @@ void UHexenCombatComponent::RefreshContactState()
 	// On every machine, not just the server: the montage plays everywhere, and ContactCount is derived
 	// from replicated state, so each machine pauses the same swing at the same contact.
 	UpdateMontagePause();
+	UpdatePoseFreeze();
 
 	// Snapped on, eased off - the easing is the tick's job, so nothing here writes a zero.
 	if (ContactCount > 0)
@@ -305,11 +602,17 @@ void UHexenCombatComponent::RefreshContactState()
 	}
 
 	// Stays on through the release, and switches itself off in the tick once the blend has reached zero.
-	SetComponentTickEnabled(ContactCount > 0 || ContactBlendAlpha > 0.f);
+	SetComponentTickEnabled(bUseBladeGuard || ContactCount > 0 || ContactBlendAlpha > 0.f);
 }
 
 void UHexenCombatComponent::UpdateMontagePause()
 {
+	// The guard stops the swing on its own schedule - see BladeGuardPauseSeconds.
+	if (bUseBladeGuard)
+	{
+		return;
+	}
+
 	if (ContactCount == 0)
 	{
 		ResumePausedMontage();
@@ -322,6 +625,11 @@ void UHexenCombatComponent::UpdateMontagePause()
 		return;
 	}
 
+	PauseCurrentMontage();
+}
+
+void UHexenCombatComponent::PauseCurrentMontage()
+{
 	// Always the main graph's instance: montages are played and stopped there, and a post-process
 	// instance plays none.
 	const USkeletalMeshComponent* Mesh = GetOwnerMesh();
@@ -347,6 +655,48 @@ void UHexenCombatComponent::UpdateMontagePause()
 			// nothing here to stop.
 			UE_LOG(LogTemp, Warning, TEXT("[BIND] %s no active montage - nothing to pause"), *GetNameSafe(GetOwner()));
 		}
+	}
+#endif
+}
+
+void UHexenCombatComponent::UpdatePoseFreeze()
+{
+	if (ContactCount == 0 || !bFreezePoseOnContact || bUseBladeGuard)
+	{
+#if !UE_BUILD_SHIPPING
+		if (bLogContactSteps && bContactPoseFrozen)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BIND] %s RELEASED pose freeze"), *GetNameSafe(GetOwner()));
+		}
+#endif
+		bContactPoseFrozen = false;
+		return;
+	}
+
+	// Already holding one. A second volume joining must not retake the snapshot - by then the arm has been
+	// pulled by the IK, and the held pose would jump to wherever that left it.
+	if (bContactPoseFrozen)
+	{
+		return;
+	}
+
+	const USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
+	if (!AnimInstance)
+	{
+		return;
+	}
+
+	// The pose as last evaluated, taken on every machine at the moment it learns of the contact: the server
+	// from the overlap, a client from the replicated contact state. A client therefore freezes a little
+	// later than the server, and whatever the pose did in between is the difference that remains.
+	AnimInstance->SavePoseSnapshot(ContactPoseSnapshotName);
+	bContactPoseFrozen = true;
+
+#if !UE_BUILD_SHIPPING
+	if (bLogContactSteps)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BIND] %s FROZE pose as '%s'"), *GetNameSafe(GetOwner()), *ContactPoseSnapshotName.ToString());
 	}
 #endif
 }
@@ -382,6 +732,254 @@ void UHexenCombatComponent::ResumePausedMontage()
 		}
 #endif
 	}
+}
+
+UHexenCombatComponent* UHexenCombatComponent::FindForActor(const AActor* Actor)
+{
+	if (!Actor)
+	{
+		return nullptr;
+	}
+
+	FScopeLock Lock(&GCombatRegistryLock);
+	const TWeakObjectPtr<UHexenCombatComponent>* Found = GCombatRegistry.Find(Actor);
+	return Found ? Found->Get() : nullptr;
+}
+
+bool UHexenCombatComponent::GetBladeGuardInput(FHexenBladeGuardInput& Out) const
+{
+	FScopeLock Lock(&BladeGuardLock);
+	if (!bUseBladeGuard || !bBladeGuardInputValid)
+	{
+		return false;
+	}
+	Out = BladeGuardInput;
+	return true;
+}
+
+void UHexenCombatComponent::SetBladeGuardResult(const FHexenBladeGuardResult& In)
+{
+	FScopeLock Lock(&BladeGuardLock);
+	BladeGuardResult = In;
+}
+
+FVector UHexenCombatComponent::GetBladeGuardCorrectionWorld() const
+{
+	FScopeLock Lock(&BladeGuardLock);
+	return BladeGuardResult.CorrectionWorld;
+}
+
+bool UHexenCombatComponent::GetHandTransformWorld(FTransform& Out) const
+{
+	const USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	if (!Mesh)
+	{
+		return false;
+	}
+	Out = Mesh->GetSocketTransform(HandBoneName, RTS_World);
+	return true;
+}
+
+void UHexenCombatComponent::UpdateBladeGuard()
+{
+	const USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	UWorld* World = GetWorld();
+
+	// What the rig did this frame. Read first, because it decides the side the rig is given next.
+	FHexenBladeGuardResult Result;
+	{
+		FScopeLock Lock(&BladeGuardLock);
+		Result = BladeGuardResult;
+	}
+
+	TArray<UHexenCollisionComponent*> Blades;
+	UHexenCollisionComponent::GetBladeVolumes(World, Blades);
+
+	// This fighter's blade, then the nearest blade in range that belongs to someone else.
+	UHexenCollisionComponent* MyBlade = nullptr;
+	for (UHexenCollisionComponent* Blade : Blades)
+	{
+		if (Blade->GetFighter() == this)
+		{
+			MyBlade = Blade;
+			break;
+		}
+	}
+
+	FHexenBladeGuardInput In;
+	bool bValid = false;
+
+	FVector MyStart, MyEnd, TheirStart, TheirEnd;
+	float MyRadius = 0.f, TheirRadius = 0.f;
+	if (Mesh && MyBlade && MyBlade->GetShapeAxisWorld(MyStart, MyEnd, MyRadius))
+	{
+		const FVector MyMiddle = (MyStart + MyEnd) * 0.5f;
+		UHexenCollisionComponent* TheirBlade = nullptr;
+		float BestDistSq = FMath::Square(BladeGuardRange);
+		for (UHexenCollisionComponent* Blade : Blades)
+		{
+			const UHexenCombatComponent* TheirFighter = Blade->GetFighter();
+			FVector Start, End;
+			float Radius = 0.f;
+			if (!TheirFighter || TheirFighter == this || !Blade->GetShapeAxisWorld(Start, End, Radius))
+			{
+				continue;
+			}
+			const float DistSq = FVector::DistSquared(MyMiddle, (Start + End) * 0.5f);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				TheirBlade = Blade;
+				TheirStart = Start;
+				TheirEnd = End;
+				TheirRadius = Radius;
+			}
+		}
+
+		if (TheirBlade)
+		{
+			// Fixed in the hand: the grip does not change, so the rig can rebuild the capsule from whatever pose
+			// the animation gives the hand.
+			const FTransform HandTM = Mesh->GetSocketTransform(HandBoneName, RTS_World);
+			In.MyAxisStartInHand = HandTM.InverseTransformPosition(MyStart);
+			In.MyAxisEndInHand = HandTM.InverseTransformPosition(MyEnd);
+			In.MyRadius = MyRadius;
+
+			// Where the partner's animation had its blade: what is drawn, minus what its own guard added on top.
+			// Measuring against the drawn blade instead would have each side answer the other's correction a
+			// frame late, and two halves chasing each other like that never settle on the contact.
+			const UHexenCombatComponent* TheirFighter = TheirBlade->GetFighter();
+			const FVector TheirCorrection = TheirFighter ? TheirFighter->GetBladeGuardCorrectionWorld() : FVector::ZeroVector;
+			In.PartnerAxisStartWorld = TheirStart - TheirCorrection;
+			In.PartnerAxisEndWorld = TheirEnd - TheirCorrection;
+			In.PartnerRadius = TheirRadius;
+
+			// One decision for the pair - which way apart, and whether the blades went through - taken by
+			// whichever fighter ticks first this frame and read by the other. Two fighters deciding for
+			// themselves could, and did, end up pushing the same way and dragging each other along.
+			const FHexenBladePair& Pair = UpdateBladePair(MyBlade, TheirBlade, BladeGuardMaxPushBack, BladeGuardSkin, BladeGuardSweepSteps);
+			In.PairAxisWorld = (Pair.First.Get() == MyBlade) ? Pair.Side : -Pair.Side;
+			In.bPairCrossed = Pair.bCrossed;
+			In.MaxPushBack = BladeGuardMaxPushBack;
+
+			// The blades met somewhere inside the frame just gone. If a swing carried this blade there, wind it
+			// back to the moment they met and stop it: from the next frame the animated blade is at the other one
+			// rather than through it.
+			if (Pair.TouchFrame == GFrameCounter)
+			{
+				RewindSwingToTouch(Pair.TouchAlpha);
+			}
+
+			In.Share = BladeGuardShare;
+			In.Skin = BladeGuardSkin;
+			bValid = true;
+		}
+	}
+
+	{
+		FScopeLock Lock(&BladeGuardLock);
+		BladeGuardInput = In;
+		bBladeGuardInputValid = bValid;
+	}
+
+#if !UE_BUILD_SHIPPING
+	if (bLogContactSteps)
+	{
+		const TCHAR* Side = (GetOwner() && GetOwner()->HasAuthority()) ? TEXT("srv") : TEXT("cli");
+		if (Result.bPenetrating || bGuardWasPushing)
+		{
+			// One line per frame while the guard is pushing, and one when it lets go. A depth that keeps
+			// growing while the correction keeps pace is a blade being held off; a correction of zero with a
+			// depth above zero would be the guard not reaching the rig at all.
+			UE_LOG(LogTemp, Warning, TEXT("[GUARD] %s %s f%llu %s%s | depth %.1fcm | correction %.1fcm | normal %s"),
+				*GetNameSafe(GetOwner()), Side, (unsigned long long)GFrameCounter,
+				Result.bPenetrating ? (bGuardWasPushing ? TEXT("push") : TEXT("START")) : TEXT("END"),
+				Result.bCrossed ? TEXT(" CROSSED") : TEXT(""),
+				Result.Depth, Result.CorrectionWorld.Size(), *Result.NormalWorld.ToCompactString());
+		}
+	}
+
+	if (bDrawContactPoints && Result.bPenetrating && World)
+	{
+		DrawDebugSphere(World, Result.ContactPointWorld, 2.f, 8, FColor::Yellow, false, -1.f);
+		DrawDebugDirectionalArrow(World, Result.ContactPointWorld, Result.ContactPointWorld + Result.CorrectionWorld * 3.f, 5.f, FColor::Red, false, -1.f);
+	}
+#endif
+
+	// Stop the swing at the blade the moment the guard first has to push, and let it go after a fixed time.
+	// On every machine, like the guard itself - each stops the swing it is drawing.
+	if (bPauseMontageOnContact && BladeGuardPauseSeconds > 0.f && World)
+	{
+		const double Now = World->GetTimeSeconds();
+		if (Result.bPenetrating && !bGuardWasPushing && !PausedMontage.IsValid())
+		{
+			PauseCurrentMontage();
+			GuardPauseStartTime = Now;
+		}
+		else if (PausedMontage.IsValid() && Now - GuardPauseStartTime >= BladeGuardPauseSeconds)
+		{
+			ResumePausedMontage();
+		}
+	}
+
+	bGuardWasPushing = Result.bPenetrating;
+
+	// Where the swing is now, for the next rewind to wind back towards.
+	const USkeletalMeshComponent* SwingMesh = GetOwnerMesh();
+	const UAnimInstance* SwingAnim = SwingMesh ? SwingMesh->GetAnimInstance() : nullptr;
+	UAnimMontage* SwingMontage = SwingAnim ? SwingAnim->GetCurrentActiveMontage() : nullptr;
+	LastSwingMontage = SwingMontage;
+	LastSwingPosition = SwingMontage ? SwingAnim->Montage_GetPosition(SwingMontage) : 0.f;
+}
+
+void UHexenCombatComponent::RewindSwingToTouch(float Alpha)
+{
+	UWorld* World = GetWorld();
+	if (!bPauseMontageOnContact || PausedMontage.IsValid() || !World)
+	{
+		return;
+	}
+
+	const USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
+	UAnimMontage* Active = AnimInstance ? AnimInstance->GetCurrentActiveMontage() : nullptr;
+
+#if !UE_BUILD_SHIPPING
+	const TCHAR* Side = (GetOwner() && GetOwner()->HasAuthority()) ? TEXT("srv") : TEXT("cli");
+#endif
+
+	if (!Active)
+	{
+#if !UE_BUILD_SHIPPING
+		if (bLogContactSteps)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[GUARD] %s %s f%llu SWEEP touch at %.0f%% of the frame | no montage to rewind"),
+				*GetNameSafe(GetOwner()), Side, (unsigned long long)GFrameCounter, Alpha * 100.f);
+		}
+#endif
+		return;
+	}
+
+	// From where the montage stood last tick to where it is now, the fraction of the way the blades had come
+	// when they met. A montage that was not playing last tick, or that has looped back since, has no
+	// "before" to wind back towards, and is only stopped where it is.
+	const float Now = AnimInstance->Montage_GetPosition(Active);
+	const float Before = (LastSwingMontage.Get() == Active && LastSwingPosition <= Now) ? LastSwingPosition : Now;
+	const float Target = FMath::Lerp(Before, Now, Alpha);
+
+	AnimInstance->Montage_SetPosition(Active, Target);
+	AnimInstance->Montage_Pause(Active);
+	PausedMontage = Active;
+	GuardPauseStartTime = World->GetTimeSeconds();
+
+#if !UE_BUILD_SHIPPING
+	if (bLogContactSteps)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[GUARD] %s %s f%llu SWEEP touch at %.0f%% of the frame | %s rewound %.3f -> %.3f (was %.3f last frame) and paused"),
+			*GetNameSafe(GetOwner()), Side, (unsigned long long)GFrameCounter, Alpha * 100.f,
+			*GetNameSafe(Active), Now, Target, Before);
+	}
+#endif
 }
 
 USkeletalMeshComponent* UHexenCombatComponent::GetOwnerMesh() const

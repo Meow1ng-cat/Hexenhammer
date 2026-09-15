@@ -72,6 +72,23 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DamageCollision|Debug")
     bool bLogContactBalance = false;
 
+    /**
+     * Debug reference: a physically simulated twin of this volume's capsule that follows the real one and
+     * BLOCKS against other volumes' twins - what these capsules would do if they were solid.
+     *
+     * The real capsules cannot block. They ride a bone, and a component moved by its parent is placed, not
+     * swept, so it never stops and never raises a hit. The twin is attached to nothing and is driven
+     * towards the real capsule's pose by velocity every frame, so Chaos's solver resolves the contact
+     * between two twins for real - with CCD on, so a blade crossing half a metre in a frame is still caught
+     * where it first touched - and reports it as a hit with the solver's own point, normal and impulse.
+     *
+     * Logged as [GHOST] lines next to what our overlap-based contact says at the same moment, and drawn:
+     * the twin in cyan, the solver's point and normal in cyan, its impulse in blue, ours in white. Touches
+     * nothing in the game - the twins see only each other.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DamageCollision|Debug")
+    bool bSpawnPhysicsGhost = false;
+
 public:
     UHexenCollisionComponent();
     virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
@@ -103,6 +120,15 @@ public:
     /** Whether anything is currently inside this volume, on this machine. */
     UFUNCTION(BlueprintPure, Category = "DamageCollision")
     bool IsOverlapping() const;
+
+    /** This volume's shape as a line and a thickness, in world space - a capsule's axis, or a single point for anything else. */
+    bool GetShapeAxisWorld(FVector& OutStart, FVector& OutEnd, float& OutRadius) const;
+
+    /** The fighter this volume belongs to, if any. */
+    UHexenCombatComponent* GetFighter() { return GetCombatComponent(); }
+
+    /** Every blade volume in play in World. Game thread. */
+    static void GetBladeVolumes(const UWorld* World, TArray<UHexenCollisionComponent*>& OutVolumes);
 
     /** Rebuilds CollisionObject to match CollisionShape (and configures its collision settings). Runs on registration, and again in-editor whenever CollisionShape changes. */
     virtual void OnRegister() override;
@@ -237,6 +263,29 @@ protected:
 
     /** The separation direction against one specific shape. False when the two are in exactly the same place. */
     bool ComputeSeparationNormalAgainst(const UPrimitiveComponent* OtherShape, FVector& OutNormal) const;
+
+    /** The capsule-geometry answer: closest points of the two axes. Fills the point, the way out (away from OtherShape) and how deep they overlap. */
+    bool ComputeAnalyticContact(const UPrimitiveComponent* OtherShape, FVector& OutPoint, FVector& OutNormal, float& OutDepth) const;
+
+    /** The simulated twin - see bSpawnPhysicsGhost. Null unless that is on. */
+    UPROPERTY(Transient)
+    UCapsuleComponent* PhysicsGhost = nullptr;
+
+    /** Builds the twin at the real capsule's pose. */
+    void SpawnPhysicsGhost();
+
+    /** Sets the twin's velocities so that this frame's physics step carries it to where the real capsule is now. */
+    void DrivePhysicsGhost(float DeltaTime);
+
+    UFUNCTION()
+    void HandleGhostHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit);
+
+    /** The current run of twin hits, so that one contact logs once when it starts and once when it ends rather than on every physics step. */
+    bool bGhostInContact = false;
+    double GhostContactStartTime = 0.0;
+    double LastGhostHitTime = 0.0;
+    int32 GhostContactHits = 0;
+    float GhostContactMaxLag = 0.f;
 
 public:
 

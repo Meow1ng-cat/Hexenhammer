@@ -23,7 +23,8 @@ public class Hexenhammer : ModuleRules
 			"OnlineSubsystemUtils"
         });
 
-		PrivateDependencyModuleNames.AddRange(new string[] { });
+		// ControlRig and RigVM for the blade guard, a rig unit that runs inside the animation evaluation.
+		PrivateDependencyModuleNames.AddRange(new string[] { "ControlRig", "RigVM" });
 
 		PublicIncludePaths.AddRange(new string[] {
 			"Hexenhammer",
