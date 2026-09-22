@@ -12,8 +12,10 @@
 #include "InputActionValue.h"
 #include "Net/UnrealNetwork.h"
 #include "Hexenhammer.h"
+#include "HexenCharacterMovementComponent.h"
 
-AHexenhammerCharacter::AHexenhammerCharacter()
+AHexenhammerCharacter::AHexenhammerCharacter(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer.SetDefaultSubobjectClass<UHexenCharacterMovementComponent>(ACharacter::CharacterMovementComponentName))
 {
 	// Set size for collision capsule
 	GetCapsuleComponent()->InitCapsuleSize(42.f, 96.0f);

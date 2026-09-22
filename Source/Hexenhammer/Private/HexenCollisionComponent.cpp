@@ -34,6 +34,19 @@ void UHexenCollisionComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProper
 	DOREPLIFETIME(UHexenCollisionComponent, ContactPointWorld);
 	DOREPLIFETIME(UHexenCollisionComponent, ContactYieldFraction);
 	DOREPLIFETIME(UHexenCollisionComponent, ContactClosingSpeed);
+	DOREPLIFETIME(UHexenCollisionComponent, bPairCrossed);
+}
+
+void UHexenCollisionComponent::SetPairCrossed(bool bCrossed)
+{
+	AActor* Owner = GetOwner();
+	if (!Owner || !Owner->HasAuthority() || bPairCrossed == bCrossed)
+	{
+		return;
+	}
+
+	bPairCrossed = bCrossed;
+	Owner->ForceNetUpdate();
 }
 
 void UHexenCollisionComponent::BeginPlay()
@@ -60,21 +73,10 @@ void UHexenCollisionComponent::BeginPlay()
 #endif
 
 	// Server only. The balance is decided there and replicated; a client measuring its own slightly
-	// different speed could only disagree with it. The physics twin is the exception: it follows the
-	// capsule on whichever machine it runs, and nothing it measures decides anything.
+	// different speed could only disagree with it.
 	const bool bTrackForBalance = NeedsVelocityTracking() && GetOwner() && GetOwner()->HasAuthority();
-	if (bTrackForBalance || bSpawnPhysicsGhost)
+	if (bTrackForBalance)
 	{
-		// The twin's velocities must be set before this frame's physics step starts. The default group,
-		// DuringPhysics, runs alongside the step, so what is set there only lands on the next one: the twin
-		// answers every frame's error a frame late, and a loop like that never settles - it rings, and looks
-		// exactly like the twin bumping into something. Moved only while the twin is on, so the gameplay
-		// tick stays where it was.
-		if (bSpawnPhysicsGhost)
-		{
-			SetTickGroup(TG_PrePhysics);
-		}
-
 		if (CollisionObject)
 		{
 			LastShapeTransform = CollisionObject->GetComponentTransform();
@@ -92,11 +94,6 @@ void UHexenCollisionComponent::BeginPlay()
 		}
 
 		SetComponentTickEnabled(true);
-	}
-
-	if (bSpawnPhysicsGhost)
-	{
-		SpawnPhysicsGhost();
 	}
 
 	// So a combat component that came up after this volume starts from a known value rather than from
@@ -118,12 +115,6 @@ void UHexenCollisionComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 	const FTransform Current = CollisionObject->GetComponentTransform();
 	VolumeVelocity = (Current.GetLocation() - LastShapeTransform.GetLocation()) / FMath::Max(DeltaTime, KINDA_SMALL_NUMBER);
 	LastShapeTransform = Current;
-
-	// Debug only, and only while bSpawnPhysicsGhost is on.
-	if (PhysicsGhost)
-	{
-		DrivePhysicsGhost(DeltaTime);
-	}
 }
 
 void UHexenCollisionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -134,12 +125,6 @@ void UHexenCollisionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	{
 		bInContact = false;
 		ReportContact();
-	}
-
-	if (PhysicsGhost)
-	{
-		PhysicsGhost->DestroyComponent();
-		PhysicsGhost = nullptr;
 	}
 
 	GVolumeRegistry.RemoveAll([this](const TWeakObjectPtr<UHexenCollisionComponent>& Entry)
@@ -167,19 +152,6 @@ void UHexenCollisionComponent::HandleShapeBeginOverlap(UPrimitiveComponent* Over
 	OverlappingShapes.Add(OtherComp);
 	RefreshShapeColor();
 	UpdateContactState();
-
-#if !UE_BUILD_SHIPPING
-	// Which of the two noticed the contact first is half of what the twin is for.
-	if (PhysicsGhost && GetWorld())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[GHOST] %s %s real BEGIN vs %s | twin %s"),
-			*GetNameSafe(GetOwner()), (GetOwner() && GetOwner()->HasAuthority()) ? TEXT("srv") : TEXT("cli"),
-			*GetNameSafe(OtherActor),
-			bGhostInContact
-				? *FString::Printf(TEXT("already in contact for %.0f ms"), (GetWorld()->GetTimeSeconds() - GhostContactStartTime) * 1000.0)
-				: TEXT("NOT in contact"));
-	}
-#endif
 }
 
 bool UHexenCollisionComponent::ShouldIgnoreOverlap(UPrimitiveComponent* OtherComp, AActor* OtherActor)
@@ -248,6 +220,11 @@ bool UHexenCollisionComponent::IsOverlapping() const
 		}
 	}
 	return false;
+}
+
+bool UHexenCollisionComponent::IsOverlappingVolume(const UHexenCollisionComponent* Other) const
+{
+	return Other && Other->CollisionObject && OverlappingShapes.Contains(TWeakObjectPtr<UPrimitiveComponent>(Other->CollisionObject));
 }
 
 void UHexenCollisionComponent::UpdateContactState()
@@ -392,7 +369,7 @@ bool UHexenCollisionComponent::GetShapeAxisWorld(FVector& OutStart, FVector& Out
 	return GetShapeAxis(CollisionObject, OutStart, OutEnd, OutRadius);
 }
 
-void UHexenCollisionComponent::GetBladeVolumes(const UWorld* World, TArray<UHexenCollisionComponent*>& OutVolumes)
+void UHexenCollisionComponent::GetGuardedVolumes(const UWorld* World, TArray<UHexenCollisionComponent*>& OutVolumes)
 {
 	OutVolumes.Reset();
 	for (const TWeakObjectPtr<UHexenCollisionComponent>& Entry : GVolumeRegistry)
@@ -450,194 +427,6 @@ bool UHexenCollisionComponent::ComputeSeparationNormalAgainst(const UPrimitiveCo
 	FVector Point;
 	float Depth = 0.f;
 	return ComputeAnalyticContact(OtherShape, Point, OutNormal, Depth) && !OutNormal.IsNearlyZero();
-}
-
-namespace
-{
-	/** A twin further than this from its capsule, and not held by a contact, has stopped following and is put back. */
-	constexpr float GhostSnapDistance = 100.f;
-
-	/** A gap in the twin's hits longer than this ends its contact. Physics raises a hit on every step the two touch. */
-	constexpr double GhostContactGapSeconds = 0.2;
-
-	float AngleBetweenDegrees(const FVector& A, const FVector& B)
-	{
-		return static_cast<float>(FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(FVector::DotProduct(A, B), -1.0, 1.0))));
-	}
-}
-
-void UHexenCollisionComponent::SpawnPhysicsGhost()
-{
-#if !UE_BUILD_SHIPPING
-	const UCapsuleComponent* Real = Cast<UCapsuleComponent>(CollisionObject);
-	if (!Real || PhysicsGhost)
-	{
-		return;
-	}
-
-	PhysicsGhost = NewObject<UCapsuleComponent>(GetOwner(), NAME_None, RF_Transient);
-	PhysicsGhost->CreationMethod = EComponentCreationMethod::Instance;
-	PhysicsGhost->SetCapsuleSize(Real->GetScaledCapsuleRadius(), Real->GetScaledCapsuleHalfHeight());
-
-	// Attached to nothing. A simulated body left attached is dragged along by its parent, which is exactly
-	// the behaviour the twin exists to get away from.
-	PhysicsGhost->SetWorldTransform(Real->GetComponentTransform());
-
-	// A channel of its own that blocks only itself: the twins meet each other and nothing else - not the
-	// world, not the real capsules, not the fighters.
-	PhysicsGhost->SetCollisionObjectType(ECC_GameTraceChannel2);
-	PhysicsGhost->SetCollisionResponseToAllChannels(ECR_Ignore);
-	PhysicsGhost->SetCollisionResponseToChannel(ECC_GameTraceChannel2, ECR_Block);
-	PhysicsGhost->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-	PhysicsGhost->SetGenerateOverlapEvents(false);
-	PhysicsGhost->SetNotifyRigidBodyCollision(true);
-	PhysicsGhost->SetEnableGravity(false);
-
-	// Without CCD the solver only sees where the twins end up each step, and at these speeds that is often
-	// already through one another - the same failure the reference is meant to be free of.
-	PhysicsGhost->BodyInstance.bUseCCD = true;
-
-	PhysicsGhost->ShapeColor = FColor::Cyan;
-	PhysicsGhost->RegisterComponent();
-	PhysicsGhost->SetSimulatePhysics(true);
-	PhysicsGhost->SetLinearDamping(0.f);
-	PhysicsGhost->SetAngularDamping(0.f);
-
-	if (GetNetMode() != NM_DedicatedServer)
-	{
-		PhysicsGhost->SetHiddenInGame(false);
-		PhysicsGhost->SetVisibility(true);
-	}
-
-	PhysicsGhost->OnComponentHit.AddDynamic(this, &UHexenCollisionComponent::HandleGhostHit);
-#endif
-}
-
-void UHexenCollisionComponent::DrivePhysicsGhost(float DeltaTime)
-{
-#if !UE_BUILD_SHIPPING
-	UWorld* World = GetWorld();
-	if (!PhysicsGhost || !CollisionObject || !World)
-	{
-		return;
-	}
-
-	const FTransform Target = CollisionObject->GetComponentTransform();
-	const FTransform Now = PhysicsGhost->GetComponentTransform();
-	const float Lag = FVector::Dist(Target.GetLocation(), Now.GetLocation());
-
-	if (bGhostInContact)
-	{
-		GhostContactMaxLag = FMath::Max(GhostContactMaxLag, Lag);
-
-		if (World->GetTimeSeconds() - LastGhostHitTime > GhostContactGapSeconds)
-		{
-			// How far the solver held the twin back from the real blade over the whole contact is the
-			// clearest single number for how much the real blades went through each other.
-			UE_LOG(LogTemp, Warning, TEXT("[GHOST] %s %s END after %d hit(s) over %.0f ms | twin held up to %.1fcm from the real blade"),
-				*GetNameSafe(GetOwner()), (GetOwner() && GetOwner()->HasAuthority()) ? TEXT("srv") : TEXT("cli"),
-				GhostContactHits, (LastGhostHitTime - GhostContactStartTime) * 1000.0, GhostContactMaxLag);
-			bGhostInContact = false;
-		}
-	}
-
-	// Too far behind to be following any more - a respawn, a teleport. Put it back rather than have it
-	// fly across the arena.
-	if (!bGhostInContact && Lag > GhostSnapDistance)
-	{
-		PhysicsGhost->SetWorldTransform(Target, false, nullptr, ETeleportType::TeleportPhysics);
-		PhysicsGhost->SetPhysicsLinearVelocity(FVector::ZeroVector);
-		PhysicsGhost->SetPhysicsAngularVelocityInRadians(FVector::ZeroVector);
-		return;
-	}
-
-	// Velocities that carry it all the way within this frame's physics step. Without substepping the step
-	// is the frame's time cut to MaxPhysicsDeltaTime, which at a low frame rate is far shorter than the
-	// frame - dividing by the frame's own time would leave the twin a long way behind the blade.
-	const UPhysicsSettings* Settings = UPhysicsSettings::Get();
-	const float StepTime = FMath::Max(Settings->bSubstepping ? DeltaTime : FMath::Min(DeltaTime, Settings->MaxPhysicsDeltaTime), KINDA_SMALL_NUMBER);
-
-	PhysicsGhost->SetPhysicsLinearVelocity((Target.GetLocation() - Now.GetLocation()) / StepTime);
-
-	FQuat Turn = Target.GetRotation() * Now.GetRotation().Inverse();
-	Turn.EnforceShortestArcWith(FQuat::Identity);
-	PhysicsGhost->SetPhysicsAngularVelocityInRadians(Turn.GetRotationAxis() * (Turn.GetAngle() / StepTime));
-#endif
-}
-
-void UHexenCollisionComponent::HandleGhostHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
-{
-#if !UE_BUILD_SHIPPING
-	UWorld* World = GetWorld();
-	if (!World || !CollisionObject || !PhysicsGhost)
-	{
-		return;
-	}
-
-	const double Now = World->GetTimeSeconds();
-	LastGhostHitTime = Now;
-	++GhostContactHits;
-
-	// Physics raises a hit on every step the twins touch. Only the first of a run is the moment of contact.
-	if (bGhostInContact)
-	{
-		return;
-	}
-	bGhostInContact = true;
-	GhostContactStartTime = Now;
-	GhostContactHits = 1;
-	GhostContactMaxLag = 0.f;
-
-	const TCHAR* Side = (GetOwner() && GetOwner()->HasAuthority()) ? TEXT("srv") : TEXT("cli");
-	const FVector SolverPoint = Hit.ImpactPoint;
-	const FVector SolverNormal = Hit.ImpactNormal;
-	const FVector PushDir = NormalImpulse.GetSafeNormal();
-	const float Lag = FVector::Dist(CollisionObject->GetComponentLocation(), PhysicsGhost->GetComponentLocation());
-
-	constexpr float DrawSeconds = 3.f;
-	constexpr float ArrowLength = 20.f;
-	DrawDebugSphere(World, SolverPoint, 2.f, 8, FColor::Cyan, false, DrawSeconds);
-	DrawDebugDirectionalArrow(World, SolverPoint, SolverPoint + SolverNormal * ArrowLength, 5.f, FColor::Cyan, false, DrawSeconds);
-	if (!PushDir.IsNearlyZero())
-	{
-		DrawDebugDirectionalArrow(World, SolverPoint, SolverPoint + PushDir * ArrowLength, 5.f, FColor::Blue, false, DrawSeconds);
-	}
-
-	// The real volume behind the other twin, so our answer for the same pair can go next to the solver's.
-	const UHexenCollisionComponent* PartnerVolume = nullptr;
-	if (OtherActor)
-	{
-		TInlineComponentArray<UHexenCollisionComponent*> Volumes(OtherActor);
-		for (const UHexenCollisionComponent* Volume : Volumes)
-		{
-			if (Volume && Volume->PhysicsGhost == OtherComp)
-			{
-				PartnerVolume = Volume;
-				break;
-			}
-		}
-	}
-
-	FString Ours = TEXT("ours: partner volume not found");
-	FVector OurPoint, OurNormal;
-	float OurDepth = 0.f;
-	if (PartnerVolume && PartnerVolume->CollisionObject && ComputeAnalyticContact(PartnerVolume->CollisionObject, OurPoint, OurNormal, OurDepth))
-	{
-		// Negative depth is a gap: the real capsules are not touching yet, or any more.
-		Ours = FString::Printf(TEXT("real capsules %s | ours: point %s normal %s depth %.1f | normal %.1fdeg from solver's, %.1fdeg from its push | points %.1fcm apart"),
-			OverlappingShapes.Contains(PartnerVolume->CollisionObject) ? TEXT("OVERLAP") : TEXT("do NOT overlap"),
-			*OurPoint.ToCompactString(), *OurNormal.ToCompactString(), OurDepth,
-			AngleBetweenDegrees(OurNormal, SolverNormal), PushDir.IsNearlyZero() ? -1.f : AngleBetweenDegrees(OurNormal, PushDir),
-			FVector::Dist(OurPoint, SolverPoint));
-
-		DrawDebugSphere(World, OurPoint, 2.f, 8, FColor::White, false, DrawSeconds);
-		DrawDebugDirectionalArrow(World, OurPoint, OurPoint + OurNormal * ArrowLength, 5.f, FColor::White, false, DrawSeconds);
-	}
-
-	UE_LOG(LogTemp, Warning, TEXT("[GHOST] %s %s HIT vs %s | solver: point %s normal %s impulse %.0f | twin %.1fcm from the real blade | %s"),
-		*GetNameSafe(GetOwner()), Side, *GetNameSafe(OtherActor),
-		*SolverPoint.ToCompactString(), *SolverNormal.ToCompactString(), NormalImpulse.Size(), Lag, *Ours);
-#endif
 }
 
 bool UHexenCollisionComponent::ComputeSeparationNormal(FVector& OutNormal) const

@@ -62,8 +62,8 @@ protected:
 
 public:
 
-	/** Constructor */
-	AHexenhammerCharacter();	
+	/** Constructor. The movement component is UHexenCharacterMovementComponent - see there. */
+	AHexenhammerCharacter(const FObjectInitializer& ObjectInitializer);
 	virtual void Tick(float DeltaTime) override;
 
 protected:

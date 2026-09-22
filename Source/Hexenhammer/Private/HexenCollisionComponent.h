@@ -72,22 +72,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DamageCollision|Debug")
     bool bLogContactBalance = false;
 
-    /**
-     * Debug reference: a physically simulated twin of this volume's capsule that follows the real one and
-     * BLOCKS against other volumes' twins - what these capsules would do if they were solid.
-     *
-     * The real capsules cannot block. They ride a bone, and a component moved by its parent is placed, not
-     * swept, so it never stops and never raises a hit. The twin is attached to nothing and is driven
-     * towards the real capsule's pose by velocity every frame, so Chaos's solver resolves the contact
-     * between two twins for real - with CCD on, so a blade crossing half a metre in a frame is still caught
-     * where it first touched - and reports it as a hit with the solver's own point, normal and impulse.
-     *
-     * Logged as [GHOST] lines next to what our overlap-based contact says at the same moment, and drawn:
-     * the twin in cyan, the solver's point and normal in cyan, its impulse in blue, ours in white. Touches
-     * nothing in the game - the twins see only each other.
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DamageCollision|Debug")
-    bool bSpawnPhysicsGhost = false;
 
 public:
     UHexenCollisionComponent();
@@ -121,14 +105,28 @@ public:
     UFUNCTION(BlueprintPure, Category = "DamageCollision")
     bool IsOverlapping() const;
 
+    /** Whether Other's shape is inside this volume, on this machine - what the overlap events last said. */
+    bool IsOverlappingVolume(const UHexenCollisionComponent* Other) const;
+
     /** This volume's shape as a line and a thickness, in world space - a capsule's axis, or a single point for anything else. */
     bool GetShapeAxisWorld(FVector& OutStart, FVector& OutEnd, float& OutRadius) const;
 
     /** The fighter this volume belongs to, if any. */
     UHexenCombatComponent* GetFighter() { return GetCombatComponent(); }
 
-    /** Every blade volume in play in World. Game thread. */
-    static void GetBladeVolumes(const UWorld* World, TArray<UHexenCollisionComponent*>& OutVolumes);
+    /**
+     * Server-side. Records what the pair decided about this volume: whether the animations have carried the blade
+     * it is against through it, so that the guard holds it back to its own side instead of following it round.
+     * Both volumes of a pair are given the same answer. Pushed at once when it changes, and nothing is sent when
+     * it does not - it changes twice a clash at most.
+     */
+    void SetPairCrossed(bool bCrossed);
+
+    /** The server's answer, on every machine - see SetPairCrossed. */
+    bool IsPairCrossed() const { return bPairCrossed; }
+
+    /** Every volume in play in World that the collision guard handles - weapons so far, since a body part has no bone the guard can move it by yet. Game thread. */
+    static void GetGuardedVolumes(const UWorld* World, TArray<UHexenCollisionComponent*>& OutVolumes);
 
     /** Rebuilds CollisionObject to match CollisionShape (and configures its collision settings). Runs on registration, and again in-editor whenever CollisionShape changes. */
     virtual void OnRegister() override;
@@ -186,6 +184,21 @@ protected:
      */
     UPROPERTY(ReplicatedUsing = OnRep_InContact)
     bool bInContact = false;
+
+    /**
+     * Whether the blade this volume is against has been carried through it, as the server sees it.
+     *
+     * Server-authoritative for the same reason bInContact is, and with harder evidence: a crossing is memory, not a
+     * measurement. It is set from a turn of more than a right angle against a side the pair remembers, so the two
+     * machines have to remember the same thing or they part company and never come back. In the 2026-09-21 run the
+     * clients called a crossing on 25% of the frames they pushed on and the server on 2%, and each client mistake
+     * was up to 74 frames of pushing blades that were three quarters of a metre apart.
+     *
+     * Plain Replicated rather than a notify: nothing acts on the change itself, the pair decision simply reads it
+     * where it used to decide - see UpdateCollisionPair.
+     */
+    UPROPERTY(Replicated)
+    bool bPairCrossed = false;
 
     /**
      * Server-side. Re-reads the contact state from OverlappingShapes after an overlap event.
@@ -266,26 +279,6 @@ protected:
 
     /** The capsule-geometry answer: closest points of the two axes. Fills the point, the way out (away from OtherShape) and how deep they overlap. */
     bool ComputeAnalyticContact(const UPrimitiveComponent* OtherShape, FVector& OutPoint, FVector& OutNormal, float& OutDepth) const;
-
-    /** The simulated twin - see bSpawnPhysicsGhost. Null unless that is on. */
-    UPROPERTY(Transient)
-    UCapsuleComponent* PhysicsGhost = nullptr;
-
-    /** Builds the twin at the real capsule's pose. */
-    void SpawnPhysicsGhost();
-
-    /** Sets the twin's velocities so that this frame's physics step carries it to where the real capsule is now. */
-    void DrivePhysicsGhost(float DeltaTime);
-
-    UFUNCTION()
-    void HandleGhostHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit);
-
-    /** The current run of twin hits, so that one contact logs once when it starts and once when it ends rather than on every physics step. */
-    bool bGhostInContact = false;
-    double GhostContactStartTime = 0.0;
-    double LastGhostHitTime = 0.0;
-    int32 GhostContactHits = 0;
-    float GhostContactMaxLag = 0.f;
 
 public:
 

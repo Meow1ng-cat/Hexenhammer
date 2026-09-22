@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Units/RigUnit.h"
-#include "HexenBladeGuardUnit.generated.h"
+#include "HexenCollisionGuardUnit.generated.h"
 
 /**
  * Keeps this fighter's blade out of the other fighter's the way a solid blade would: moves the hand only
@@ -26,8 +26,8 @@
  * the partner's capsule as the partner's animation had it, and the pair's decision - and writes back what it
  * did, so the partner can take it off again next frame. Feed EffectorTransform to a FABRIK that ends at HandBone.
  */
-USTRUCT(meta = (DisplayName = "Hexen Blade Guard", Category = "Hexenhammer", Keywords = "Blade,Contact,Collision,Bind,Guard"))
-struct FRigUnit_HexenBladeGuard : public FRigUnitMutable
+USTRUCT(meta = (DisplayName = "Hexen Collision Guard", Category = "Hexenhammer", Keywords = "Blade,Contact,Collision,Bind,Guard"))
+struct FRigUnit_HexenCollisionGuard : public FRigUnitMutable
 {
 	GENERATED_BODY()
 
@@ -38,11 +38,42 @@ struct FRigUnit_HexenBladeGuard : public FRigUnitMutable
 	UPROPERTY(meta = (Input))
 	FName HandBone = FName("hand_r");
 
-	/** Where the hand has to go: the animated hand, pushed out by this fighter's share of the overlap. Global (rig) space. */
+	/**
+	 * The bone the solver is aimed by: one of the rig's own, hanging off the hand, which this unit parks each frame on
+	 * the spot of this blade that touches the other. End the FABRIK at it, and the solver turns the wrist and the arm to
+	 * put that spot where it has to be. A hand pushed bodily cannot turn the blade at all, and the wrist took no part in
+	 * the correction before.
+	 *
+	 * It does not have to exist on the mesh: only the mesh's own bones are written back, and this one is needed inside
+	 * the rig alone. Left out of the hierarchy, or named wrong, the unit falls back to aiming the hand itself.
+	 */
+	UPROPERTY(meta = (Input))
+	FName ContactBone = FName("WeaponContactBone");
+
+	/**
+	 * Where the aimed bone has to go: the touching spot of this blade, pushed out by this fighter's share of the overlap.
+	 * Global (rig) space. Without a contact bone it is the animated hand pushed out the same way.
+	 */
 	UPROPERTY(meta = (Output))
 	FTransform EffectorTransform = FTransform::Identity;
 
 	/** How far the two capsules overlap in the animated pose, in cm. Zero or less means they do not, and EffectorTransform is the animated hand. */
 	UPROPERTY(meta = (Output))
 	float Depth = 0.f;
+};
+
+/**
+ * EXPERIMENT (2026-09-22) - draws the server's pose instead of this machine's own, for the bones the fighter's combat
+ * component lists in ServerPoseBones. Put it last in the rig, after the FABRIK, so what it writes is what is drawn.
+ *
+ * Does nothing on the server, with UHexenCombatComponent::bReplicateServerPose off, and until a pose has arrived - so
+ * leaving it wired costs a lookup and a lock a frame and changes nothing when the experiment is off.
+ */
+USTRUCT(meta = (DisplayName = "Hexen Server Pose", Category = "Hexenhammer", Keywords = "Replication,Server,Pose"))
+struct FRigUnit_HexenServerPose : public FRigUnitMutable
+{
+	GENERATED_BODY()
+
+	RIGVM_METHOD()
+	virtual void Execute() override;
 };
