@@ -281,7 +281,7 @@ sequenceDiagram
 
 ### 7.1 `CR_BladeBlock` — Control Rig (главный)
 
-`/Game/Characters/Mannequins/Meshes/CR_BladeBlock`, работает со скелетом `SKM_Manny_Simple`.
+`/Game/Characters/Mannequins/Meshes/CR_BladeBlock`. Иерархия набрана из костей скелета `SK_Mannequin` — это скелет меша `SKM_Manny_Simple`, который носит персонаж.
 
 **Иерархия.** 162 кости (у меша 89; 09-18 иерархия дополнена костями из меша, добавлено 72). Лишние кости безвредны — важно, чтобы были кости цепочки и:
 
@@ -304,7 +304,7 @@ RigUnit_BeginExecution
         EffectorTransform ← от guard
         bPropagateToChildren = true
         bSetEffectorTransform = true
-        Weight = 1;  Precision и MaxIterations — умолчания узла (перепроверить в редакторе)
+        Weight = 1.0;  Precision = 0.1;  MaxIterations = 50  (все три проверены 09-23; 50 — не умолчание узла)
   └→ Hexen Server Pose   (FRigUnit_HexenServerPose, добавлен 09-22)
         пинов, кроме выполнения, нет; должен стоять ПОСЛЕДНИМ, после FABRIK
 ```
@@ -319,7 +319,9 @@ RigUnit_BeginExecution
 
 `ABP_Unarmed` (`/Game/Characters/Mannequins/Anims/Unarmed/`): узел Control Rig с `CR_BladeBlock`, последним в графе — после него позу никто не трогает. Настройки узла проверялись 09-18 и возвращены в: `bTransferPoseInGlobalSpace` = false, `bSetRefPoseFromSkeleton` = false. Там же остались `Blend Poses by bool` и `Pose Snapshot` «ContactFreeze» от старого механизма — в режиме guard не используются.
 
-Не перепроверено 09-22 (редактор был закрыт): участвует ли в цепочке `ABP_CombatPostProcess`, лежащий рядом с ригом. Подтвердить в редакторе.
+Проверено 09-23: меш персонажа (`CharacterMesh0` в `BP_ThirdPersonCharacter`) — `SKM_Manny_Simple` с `AnimClass = ABP_Unarmed`, а у самого меша **post-process ABP не задан** (`PostProcessAnimBlueprint` = None). То есть риг действительно последний в цепочке и после него позу ничто не меняет — на это опирается разбор вопроса 7.
+
+**Осторожно:** на `CR_BladeBlock` ссылается ещё и `ABP_CombatPostProcess` (лежит рядом с ригом), но к персонажу он не подключён ни как `AnimClass`, ни как post-process меша. Это остаток; если он когда-нибудь окажется в цепочке, риг выполнится дважды.
 
 ### 7.3 `BP_Weapontest4` — оружие
 
