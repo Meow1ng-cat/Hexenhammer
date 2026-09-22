@@ -163,7 +163,7 @@ sequenceDiagram
 
 **Как тестировать:** PIE → удары и удержания → лог `Saved/Logs/Hexenhammer.log` от последней строки `PIE: Play in editor total start time`. Сравнивать прогоны только при похожих условиях: FPS (PIE идёт 19–43 к/с, редактор без фокуса падает до 3 к/с, видеопамять переполнена) и число контактов.
 
-**Ассеты, изменённые вне git:** `CR_BladeBlock` (цепочка Begin → Guard → FABRIK, старые `SetTransform_1/_3` отключены; 09-18 иерархия дополнена костями из `SKM_Manny_Simple` — добавлено 72 корректирующих кости, `WeaponContactBone` сохранена; копия до этого: `CR_BladeBlock.backup-20260918-023002.uasset` в scratchpad сессии), `ABP_Unarmed` (Blend Poses by bool + Pose Snapshot; настройки узла Control Rig проверялись и возвращены: `bTransferPoseInGlobalSpace` = false, `bSetRefPoseFromSkeleton` = false), `BP_ThirdPersonCharacter` (Tick ставит `ContactPoseFrozen`; HexenCombat: `SweepSteps` 37, решение на пару вкл; удар идёт `Server_RequestAttack` → `Multicast_PlayAttack` → `PlayAnimMontage`, то есть **уже через сервер и без предсказания** — свой замах клиент не начинает, пока не вернётся мультикаст), `BP_Weapontest4` (`CapsuleRadius`; `BladeSocketName` **не задан** — капсула висит на пивоте меша оружия, а не на клинке, предупреждение в логе каждый запуск).
+**Ассеты, изменённые вне git** (полный состав и как собрать заново — раздел 7)**:** `CR_BladeBlock` (цепочка Begin → Guard → FABRIK, старые `SetTransform_1/_3` отключены; 09-18 иерархия дополнена костями из `SKM_Manny_Simple` — добавлено 72 корректирующих кости, `WeaponContactBone` сохранена; копия до этого: `CR_BladeBlock.backup-20260918-023002.uasset` в scratchpad сессии), `ABP_Unarmed` (Blend Poses by bool + Pose Snapshot; настройки узла Control Rig проверялись и возвращены: `bTransferPoseInGlobalSpace` = false, `bSetRefPoseFromSkeleton` = false), `BP_ThirdPersonCharacter` (Tick ставит `ContactPoseFrozen`; HexenCombat: `SweepSteps` 37, решение на пару вкл; удар идёт `Server_RequestAttack` → `Multicast_PlayAttack` → `PlayAnimMontage`, то есть **уже через сервер и без предсказания** — свой замах клиент не начинает, пока не вернётся мультикаст), `BP_Weapontest4` (`CapsuleRadius`; `BladeSocketName` **не задан** — капсула висит на пивоте меша оружия, а не на клинке, предупреждение в логе каждый запуск).
 
 09-21 в `CR_BladeBlock` цепочка FABRIK дополнена `WeaponContactBone` последним звеном. Новые элементы массива в RigVM добавляются **свёрнутыми**, поэтому в редакторе кажется, что пятого звена нет, — надо раскрыть последнюю строку `Items`.
 
@@ -270,3 +270,75 @@ sequenceDiagram
 - **Метод «реплицировать всё, затем убирать»** (09-22, твой): начинать с заведомо рабочей максимальной версии и снимать по одной части, пока не сломается. Чтобы раздевание не требовало пересборки, каждая часть — отдельная галочка или список в редакторе (категория Combat → Replication Experiment).
 - **Никаких частных случаев** (09-22, твоё): решение должно быть универсальным. Шаг «свой боец рисуется своей анимацией, чужие — серверной» отвергнут как костыль и удалён из кода.
 - **Урок по замерам** (09-22). (1) Разрывы надо взвешивать **по времени**, а не по числу событий: «93% прибытий каждый кадр» скрывали то, что половину времени поза стояла. (2) Средняя скорость соединения ничего не говорит о насыщении: бюджет выдаётся на тик, и то, что не влезло, не копится, а пропадает. Смотреть надо в `LogNetTraffic`. (3) Прежде чем мерить тайминги в редакторе, проверить, не спит ли он: троттлинг в фоне выдаёт ровно 333 мс на кадр и незаметно отравляет всё.
+
+---
+
+## 7. Ассеты: что в них и как собрать заново
+
+**Зачем этот раздел.** В `.gitignore` стоит `*.uasset`, поэтому ни один ассет в репозиторий не попадает. Код без них не работает: guard живёт в Control Rig, а удар запускается из блюпринта персонажа. Здесь записано всё, чего нет в git, — чтобы это можно было восстановить или написать заново.
+
+Снято с живых ассетов 09-21 и 09-22. Помечено, что проверено инструментом, а что — на глаз и требует подтверждения в редакторе.
+
+### 7.1 `CR_BladeBlock` — Control Rig (главный)
+
+`/Game/Characters/Mannequins/Meshes/CR_BladeBlock`, работает со скелетом `SKM_Manny_Simple`.
+
+**Иерархия.** 162 кости (у меша 89; 09-18 иерархия дополнена костями из меша, добавлено 72). Лишние кости безвредны — важно, чтобы были кости цепочки и:
+
+| Кость | Родитель | Локальный трансформ |
+|---|---|---|
+| `WeaponContactBone` | `hand_r` | смещение (10, 20, 0), поворот 0, масштаб 1 |
+
+Этой кости **нет и не должно быть в меше**: обратно в позу пишутся только кости меша, а эта нужна лишь внутри рига. Её начальное смещение почти ни на что не влияет — каждый кадр узел ставит её туда, где клинки касаются; смещение видно только вне контакта, когда узел просит решатель никуда не двигаться.
+
+**Граф Forward Solve — живая цепочка** (проверено инструментом):
+
+```
+RigUnit_BeginExecution
+  └→ Hexen Collision Guard   (узел в графе называется HexenBladeGuard — имя с тех пор, как его переименовали)
+        HandBone    = hand_r
+        ContactBone = WeaponContactBone
+        EffectorTransform ──┐   (Depth не подключён)
+  └→ Basic FABRIK  (FABRIKItemArray_2)                        ←┘
+        Items = clavicle_r, upperarm_r, lowerarm_r, hand_r, WeaponContactBone   (именно в этом порядке)
+        EffectorTransform ← от guard
+        bPropagateToChildren = true
+        bSetEffectorTransform = true
+        Weight = 1;  Precision и MaxIterations — умолчания узла (перепроверить в редакторе)
+  └→ Hexen Server Pose   (FRigUnit_HexenServerPose, добавлен 09-22)
+        пинов, кроме выполнения, нет; должен стоять ПОСЛЕДНИМ, после FABRIK
+```
+
+**Ловушка редактора:** новые элементы массива в RigVM показываются **свёрнутыми**. После добавления пятого звена в `Items` кажется, что его нет, — надо раскрыть последнюю строку `Items`.
+
+**Мёртвые узлы в графе** — от храповика и заморозки позы, висят за невыполняемой веткой `ControlFlowBranch` и при сборке заново не нужны: `HierarchyGetChainItemArray`, `Not_Equals`, `GetTransformItemArray`, `SetTransformItemArray`, `RigUnit_GetTransform_1`, `RigUnit_SetTransform_1`, `RigUnit_SetTransform_3`, `VariableNode_1…9` и переменные, которые они читают (`ContactHandOffset`, `ContactTarget`, `ContactBindId`, `LastBindId`, `FrozenPose`).
+
+**Собрать заново:** Control Rig на скелете `SKM_Manny_Simple` → добавить кость `WeaponContactBone` на `hand_r` → в Forward Solve четыре узла выше, связать выполнение по порядку и `EffectorTransform` от guard в FABRIK → выставить пины → сохранить. Больше ничего не нужно: вся логика в C++.
+
+### 7.2 Где риг подключён
+
+`ABP_Unarmed` (`/Game/Characters/Mannequins/Anims/Unarmed/`): узел Control Rig с `CR_BladeBlock`, последним в графе — после него позу никто не трогает. Настройки узла проверялись 09-18 и возвращены в: `bTransferPoseInGlobalSpace` = false, `bSetRefPoseFromSkeleton` = false. Там же остались `Blend Poses by bool` и `Pose Snapshot` «ContactFreeze» от старого механизма — в режиме guard не используются.
+
+Не перепроверено 09-22 (редактор был закрыт): участвует ли в цепочке `ABP_CombatPostProcess`, лежащий рядом с ригом. Подтвердить в редакторе.
+
+### 7.3 `BP_Weapontest4` — оружие
+
+- `WeaponCollision` — компонент `UWeaponCollisionComponent` (наследник `UHexenCollisionComponent`): `CollisionShape` = Capsule, `CapsuleRadius` 15, `CapsuleHalfHeight` 60, смещение z = −62.8 от пивота меша оружия.
+- **`BladeSocketName` не задан** — компонент висит на пивоте меша оружия, а не на клинке; предупреждение в логе при каждом запуске. Твоё наблюдение: центр капсулы и пивот `BP_Weapontest4` не совпадают. Не исправлено.
+- Саму капсулу компонент **строит себе сам** в `EnsureCollisionObject` (transient-подобъект по `CapsuleRadius`/`CapsuleHalfHeight`), поэтому в блюпринте отдельного капсульного компонента искать не надо.
+- Геометрия, о которую легко споткнуться: ось капсулы короче её самой на радиус с каждого конца (`HalfLine = HalfHeight − Radius`), и весь расчёт контакта идёт **между осями**, а шляпки учитываются только через радиус.
+
+### 7.4 `BP_ThirdPersonCharacter` — боец
+
+- Компонент `HexenCombat` (`UHexenCombatComponent`). Значения, отличные от умолчаний C++: `SweepSteps` 37, решение на пару включено. Остальное — в разделе 2.
+- Меш: `VisibilityBasedAnimTickOption` = `AlwaysTickPose` (значение блюпринта), оптимизация частоты анимации выключена. На выделенном сервере C++ поднимает это до `AlwaysTickPoseAndRefreshBones` (`AHexenhammerCharacter::BeginPlay`), потому что там меш невидим и кости иначе не обновлялись бы.
+- **Ввод идёт через сервер, предсказания нет:** `Server_RequestAttack` → `Multicast_PlayAttack` → `PlayAnimMontage`. Так же устроен блок (`Server_RequestBlock` → `Multicast_PlayBlock`), бег (`ServerReq_Run`, `ServerReq_StopRun`) и гард (`ServerReqGuardOn`, `ServerReqGuardOff`, `ServerReq_GuardDrag`). Свой замах клиент не начинает, пока не вернётся мультикаст, — это и есть то, чего не хватает для пункта 2 плана по авторитарности.
+- Tick выставляет `ContactPoseFrozen` — от старого механизма заморозки позы.
+
+### 7.5 Что живёт только в коде
+
+Код в git, но в этом документе описано не всё; если механику не найти здесь, она в комментариях у объявлений:
+
+- **Энергетический баланс контакта** — `MeasureContactBalance`, `ContactYieldFraction` (доля, на которую уступает этот объём), `ContactClosingSpeed`, `GetContactPush`/`GetContactMass`. Считается на сервере при начале контакта и реплицируется. Это заготовка под твою физику на массе, скорости и энергии; guard сейчас делит перекрытие поровну (`Share` 0.5) и баланс не читает.
+- **Канал и фильтрация перекрытий** — объёмы живут на своём канале `ECC_GameTraceChannel1` («HexenBlade»), QueryOnly, отвечают только друг другу. `ShouldIgnoreOverlap` отсеивает **свои же** объёмы по тому, к какому бойцу они относятся, а не по владельцу актёра: владелец у оружия выставляется не сразу и иногда не выставляется вовсе, и тогда собственный дубликат меча читался бы как чужой клинок. Канал `GameTraceChannel2` («HexenGhost») остался от удалённого физического двойника и больше не используется.
+- **Цвет капсулы** — `RefreshShapeColor` красит сам объём: `ClearShapeColor`, пока ничего не касается, `ContactShapeColor`, пока касается. Это не состояние узла: узел держит клинки на грани касания, поэтому при удержании цвет может мигать.
