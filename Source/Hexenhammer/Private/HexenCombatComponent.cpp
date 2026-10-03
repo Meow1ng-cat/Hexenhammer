@@ -67,6 +67,16 @@ namespace
 		 * ended - the end of the contact - from blades that have not come to overlap yet.
 		 */
 		bool bWasOverlapping = false;
+
+		/**
+		 * Set in the frame a crossing was declared on a swept meeting ALONE - nothing overlapping now, nothing
+		 * overlapping before, nothing touching in the previous pose. Whether that meeting was real is settled by
+		 * whether a swing gets wound back to it, which is only known after the attempt, so the caller undoes the
+		 * crossing when none was - see UHexenCombatComponent::UpdateHexenCollisionGuard. SweepFallbackSide is the
+		 * direction the other reading of the same flip would have taken.
+		 */
+		bool bCrossedOnSweepAlone = false;
+		FVector SweepFallbackSide = FVector::ZeroVector;
 	};
 
 	TMap<TPair<const UHexenCollisionComponent*, const UHexenCollisionComponent*>, FHexenCollisionPair> GCollisionPairs;
@@ -99,7 +109,7 @@ namespace
 		// the pose between the rig and the screen.
 		FVector AnimatedStart, AnimatedEnd;
 		FTransform AnimatedHand;
-		if (Fighter->GetHexenCollisionGuardAnimatedPose(AnimatedStart, AnimatedEnd, AnimatedHand))
+		if (Fighter->GetHexenCollisionGuardActingPose(AnimatedStart, AnimatedEnd, AnimatedHand))
 		{
 			Out.Start = AnimatedStart;
 			Out.End = AnimatedEnd;
@@ -155,8 +165,8 @@ namespace
 		float RadiusA = 0.f;
 		float RadiusB = 0.f;
 		if (!FighterA || !FighterB
-			|| !FighterA->GetHexenCollisionGuardAnimatedPose(StartA, EndA, HandA)
-			|| !FighterB->GetHexenCollisionGuardAnimatedPose(StartB, EndB, HandB)
+			|| !FighterA->GetHexenCollisionGuardActingPose(StartA, EndA, HandA)
+			|| !FighterB->GetHexenCollisionGuardActingPose(StartB, EndB, HandB)
 			|| !A->GetShapeAxisWorld(DrawnStart, DrawnEnd, RadiusA)
 			|| !B->GetShapeAxisWorld(DrawnStart, DrawnEnd, RadiusB))
 		{
@@ -205,7 +215,7 @@ namespace
 	 * one another - from where both animations had the blades, so the two fighters' corrections do not feed
 	 * back into it.
 	 */
-	FHexenCollisionPair& UpdateCollisionPair(UHexenCollisionComponent* A, UHexenCollisionComponent* B, float Skin, int32 SweepSteps, bool bRigPoseOverlap, bool bAuthority, bool bLog)
+	FHexenCollisionPair& UpdateCollisionPair(UHexenCollisionComponent* A, UHexenCollisionComponent* B, float Skin, int32 SweepSteps, bool bRigPoseOverlap, bool bAuthority, bool bLog, uint64 PreviousUpdateFrame, bool bResetStalePair)
 	{
 		for (auto It = GCollisionPairs.CreateIterator(); It; ++It)
 		{
@@ -224,18 +234,54 @@ namespace
 		{
 			return Pair;
 		}
+		// A record that was not touched on this fighter's PREVIOUS tick is not a previous frame. It is a pair
+		// that went out of range, or stopped being the nearest one, and has come back - and everything in the
+		// record describes a moment that can be seconds and metres away. Left standing, all of it is read as
+		// if one frame had passed: the sweep drags both blades from their old poses to their new ones across
+		// thirty-odd sub-steps and finds a "meeting" somewhere in the middle of the room; the stale Side turns
+		// the first comparison into a flip; and a flip with a swept touch, or with a bWasOverlapping left over
+		// from the last clash, is read as carried through. From there the guard measures depth along a frozen
+		// axis, which GROWS with distance, and hauls a blade about with nothing anywhere near it.
+		//
+		// Compared against this fighter's own previous tick rather than against GFrameCounter - 1: the server
+		// runs at a fixed 30 while the engine frame counter runs at whatever it runs at, so consecutive ticks
+		// are not consecutive frames, and "one frame ago" would reset the record constantly and kill the sweep.
+		const bool bStale = bResetStalePair && Pair.Frame != 0 && Pair.Frame != PreviousUpdateFrame;
+		if (bStale)
+		{
+#if !UE_BUILD_SHIPPING
+			if (bLog)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[GUARD] %s vs %s f%llu PAIR RESET - last seen f%llu, not this fighter's previous tick f%llu: starting the pair over"),
+					*GetNameSafe(First->GetOwner()), *GetNameSafe(Second->GetOwner()),
+					(unsigned long long)GFrameCounter, (unsigned long long)Pair.Frame, (unsigned long long)PreviousUpdateFrame);
+			}
+#endif
+			// Everything that means "and this is where we were a moment ago". Side left at zero sends the
+			// decision below down its own first-frame path, which is exactly what this is.
+			Pair.Side = FVector::ZeroVector;
+			Pair.bCrossed = false;
+			Pair.bHasPrevious = false;
+			Pair.bWasOverlapping = false;
+			Pair.TouchFrame = 0;
+			Pair.TouchAlpha = 0.f;
+			if (bAuthority)
+			{
+				First->SetPairCrossed(false);
+				Second->SetPairCrossed(false);
+			}
+		}
+
 		Pair.First = First;
 		Pair.Second = Second;
 		Pair.Frame = GFrameCounter;
 		Pair.SideBefore = Pair.Side;
 		Pair.bCrossedBefore = Pair.bCrossed;
+		Pair.bCrossedOnSweepAlone = false;
 
-		// The contact ends where the overlap does - see the crossed branch below. On the drawn volumes, or in the pose the
-		// rigs put out - see UHexenCombatComponent::bHexenCollisionGuardRigPoseOverlap.
-		const bool bOverlapping = bRigPoseOverlap ? AreOverlappingInRigPose(First, Second) : AreOverlapping(First, Second);
+		// Whether the two were in one another at the last decision. What they are doing NOW is worked out below,
+		// once the animated poses are in hand - see bAnimatedTouching.
 		const bool bWasOverlapping = Pair.bWasOverlapping;
-		const bool bOverlapEnded = bWasOverlapping && !bOverlapping;
-		Pair.bWasOverlapping = bOverlapping;
 
 		FAnimatedVolume FirstVolume, SecondVolume;
 		if (!GetAnimatedVolume(First, FirstVolume) || !GetAnimatedVolume(Second, SecondVolume))
@@ -271,6 +317,23 @@ namespace
 		bool bSweptTouch = false;
 		bool bWereTouching = false;
 		const float Reach = FirstRadius + SecondRadius - Skin;
+
+		// Whether the two are in one another now, in the pose the ANIMATIONS asked for - not in the pose the guard
+		// left behind.
+		//
+		// This used to be AreOverlappingInRigPose, which is the animated pose plus each guard's own correction, and
+		// that made the question circular: the guard pushes, the pushed poses overlap, the overlap is taken as proof
+		// that the blades met, a crossing is declared on it, the axis freezes, depth along a frozen axis grows with
+		// distance, and the guard pushes harder. On 09-26 a contact STARTED already crossed with the drawn capsules
+		// 86.8 cm apart - a frame earlier they had been 21.6 cm apart and flying apart at 65 cm a frame. Nothing
+		// touched anything; the guard was reading its own output back as evidence.
+		//
+		// Measured against Reach, the same touching distance the sweep and the guard use, from the same two closest
+		// points the side is taken from. So no new figure and no new threshold - the one that was here was simply
+		// looking at the wrong pose.
+		const bool bAnimatedTouching = FVector::Dist(OnFirst, OnSecond) < Reach;
+		const bool bOverlapEnded = bWasOverlapping && !bAnimatedTouching;
+		Pair.bWasOverlapping = bAnimatedTouching;
 		if (Pair.bHasPrevious)
 		{
 			auto VolumeAt = [](const FTransform& Hand, const FAnimatedVolume& Volume, FVector& OutStart, FVector& OutEnd)
@@ -355,7 +418,7 @@ namespace
 			}
 		}
 		else if (bFlipped
-			&& (bOverlapping || bWasOverlapping || bSweptTouch)
+			&& (bAnimatedTouching || bWasOverlapping || bSweptTouch)
 			&& (bSweptTouch || bWereTouching || (IsOnBody(OnFirst, FirstStart, FirstEnd) && IsOnBody(OnSecond, SecondStart, SecondEnd))))
 		{
 			// Turned past a right angle in one frame, and the animations carried them through: the sweep saw them meet on
@@ -371,6 +434,18 @@ namespace
 			// 2026-09-21 run one such crossing held for 1172 frames while the blades flew half a metre apart, and the
 			// guard pushed harder the further they went - depth along the frozen axis grows with the distance.
 			Pair.bCrossed = true;
+
+			// And a meeting only the sweep saw is not evidence on its own. The sweep says the two came within reach
+			// somewhere between the last pose and this one; whether that meeting is real is settled by whether a
+			// swing is wound back to it, because that is what brings the blades to the touching pose and makes an
+			// overlap begin. When none is, no overlap will ever begin and this state - which is only left when an
+			// overlap ENDS - can never be left again. The 09-26 run is the whole argument: 11 of 12 crossings were
+			// declared exactly this way, not one swing was wound back to any of them, two thirds of every contact
+			// frame was spent latched, and the worst frame claimed 82 cm of depth across 164 cm of daylight.
+			//
+			// Undone by the caller rather than here, because the outcome of the rewind is not known yet.
+			Pair.bCrossedOnSweepAlone = bSweptTouch && !bAnimatedTouching && !bWasOverlapping && !bWereTouching;
+			Pair.SweepFallbackSide = Normal;
 		}
 		else
 		{
@@ -498,6 +573,8 @@ void UHexenCombatComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 	DOREPLIFETIME(UHexenCombatComponent, bServerSwingHeld);
 	DOREPLIFETIME(UHexenCombatComponent, ServerSwingHoldPosition);
 	DOREPLIFETIME(UHexenCombatComponent, ServerSwingHoldMontage);
+	DOREPLIFETIME(UHexenCombatComponent, KnockImpulseSerial);
+	DOREPLIFETIME(UHexenCombatComponent, KnockImpulseVelocity);
 	DOREPLIFETIME(UHexenCombatComponent, ServerPose);
 	DOREPLIFETIME(UHexenCombatComponent, ServerPoseFrame);
 	DOREPLIFETIME(UHexenCombatComponent, ServerGuardResult);
@@ -909,6 +986,7 @@ void UHexenCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 	{
 		// The rig decides from the animated pose every frame; there is no target to chase and no blend to ease.
 		ContactBlendAlpha = 1.f;
+		IntegrateKnock(DeltaTime);
 		UpdateHexenCollisionGuard();
 		return;
 	}
@@ -1080,7 +1158,7 @@ void UHexenCombatComponent::UpdateMontagePause()
 	}
 
 	// Already holding one - a second volume joining the contact changes nothing about the swing.
-	if (!bPauseMontageOnContact || PausedMontage.IsValid())
+	if (!bPauseMontageOnContact || IsHoldingSwing())
 	{
 		return;
 	}
@@ -1190,6 +1268,26 @@ void UHexenCombatComponent::UpdatePoseFreeze()
 		UE_LOG(LogTemp, Warning, TEXT("[BIND] %s FROZE pose as '%s'"), *GetNameSafe(GetOwner()), *ContactPoseSnapshotName.ToString());
 	}
 #endif
+}
+
+bool UHexenCombatComponent::IsHoldingSwing() const
+{
+	if (!PausedMontage.IsValid())
+	{
+		return false;
+	}
+
+	const USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
+	if (!AnimInstance)
+	{
+		return false;
+	}
+
+	// The instance, not the asset - see the declaration. A hold whose instance is gone holds nothing, and
+	// must not stand in the way of holding the swing that replaced it.
+	const FAnimMontageInstance* Instance = AnimInstance->GetActiveInstanceForMontage(PausedMontage.Get());
+	return Instance && Instance->GetInstanceID() == PausedMontageInstanceID;
 }
 
 void UHexenCombatComponent::ResumePausedMontage()
@@ -1316,16 +1414,16 @@ bool UHexenCombatComponent::GetHexenCollisionMovementBlock(FVector& OutOutward, 
 	return true;
 }
 
-bool UHexenCombatComponent::GetHexenCollisionGuardAnimatedPose(FVector& OutStart, FVector& OutEnd, FTransform& OutHand) const
+bool UHexenCombatComponent::GetHexenCollisionGuardActingPose(FVector& OutStart, FVector& OutEnd, FTransform& OutHand) const
 {
 	FScopeLock Lock(&HexenCollisionGuardLock);
-	if (!HexenCollisionGuardResult.bHasAnimatedPose)
+	if (!HexenCollisionGuardResult.bHasActingPose)
 	{
 		return false;
 	}
-	OutStart = HexenCollisionGuardResult.AnimatedAxisStartWorld;
-	OutEnd = HexenCollisionGuardResult.AnimatedAxisEndWorld;
-	OutHand = HexenCollisionGuardResult.AnimatedHandWorld;
+	OutStart = HexenCollisionGuardResult.ActingAxisStartWorld;
+	OutEnd = HexenCollisionGuardResult.ActingAxisEndWorld;
+	OutHand = HexenCollisionGuardResult.ActingHandWorld;
 	return true;
 }
 
@@ -1340,6 +1438,93 @@ bool UHexenCombatComponent::GetHandTransformWorld(FTransform& Out) const
 	return true;
 }
 
+void UHexenCombatComponent::ApplyContactKnock(const FVector& NormalWorld, float ClosingSpeedCmS, float MyResistance, float TheirResistance)
+{
+	const float Total = MyResistance + TheirResistance;
+	if (!bHexenCollisionGuardKnock || !GetOwner() || !GetOwner()->HasAuthority() || ClosingSpeedCmS <= 0.f || Total <= KINDA_SMALL_NUMBER || NormalWorld.IsNearlyZero())
+	{
+		return;
+	}
+
+	// The impulse that stops two bodies closing is the reduced mass times how fast they were closing, and
+	// what it buys each of them is that over its own effective mass. Written out, this side's share of it
+	// is simply the share it gives way by - the same number the guard splits the overlap with, so the
+	// blade that yields is the blade that is thrown, by construction rather than by a second rule.
+	//
+	// Restitution 0 is not "no impulse": it is the dead clash, where the struck blade is swept up to the
+	// striking one's speed and no further. It is 1 that would throw it back as fast as it came.
+	//
+	// Scaled by how lopsided the balance came out, and not by the yield on its own. An even meeting has a
+	// yield near a half and must NOT be thrown apart: two blades meeting evenly hold each other, which is
+	// what a bind is. Only a decisive imbalance sends a blade away. Without this an even bind at 0.53 threw
+	// as hard as a beat at 0.91.
+	const float Yield = TheirResistance / Total;
+	const float Imbalance = FMath::Abs(2.f * Yield - 1.f);
+	const float DeltaSpeed = (1.f + FMath::Clamp(HexenCollisionGuardKnockRestitution, 0.f, 1.f)) * ClosingSpeedCmS * Yield * Imbalance;
+
+	// Added, not replaced: a second clash while the first is still dying away pushes further, which is
+	// what a second clash does. The cap on the offset is what keeps that from running away.
+	KnockVelocity += NormalWorld.GetSafeNormal() * DeltaSpeed;
+
+	// Told to the clients as one event. They run the same decay from it, so nothing further goes over.
+	KnockImpulseVelocity = KnockVelocity;
+	++KnockImpulseSerial;
+	GetOwner()->ForceNetUpdate();
+
+#if !UE_BUILD_SHIPPING
+	if (bLogContactSteps)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[KNOCK] %s srv f%llu | closing %.0fcm/s | yield %.2f | thrown at %.0fcm/s, serial %d"),
+			*GetNameSafe(GetOwner()), (unsigned long long)GFrameCounter, ClosingSpeedCmS, Yield, DeltaSpeed, KnockImpulseSerial);
+	}
+#endif
+}
+
+void UHexenCombatComponent::OnRep_KnockImpulse()
+{
+	// The server's word for how fast this blade was thrown. The decay from here is this machine's own work.
+	KnockVelocity = KnockImpulseVelocity;
+
+#if !UE_BUILD_SHIPPING
+	if (bLogContactSteps)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[KNOCK] %s cli f%llu | thrown at %.0fcm/s, serial %d - taken from the server"),
+			*GetNameSafe(GetOwner()), (unsigned long long)GFrameCounter, KnockVelocity.Size(), KnockImpulseSerial);
+	}
+#endif
+}
+
+void UHexenCombatComponent::IntegrateKnock(float DeltaTime)
+{
+	// Nothing thrown and nothing left over: the usual case, and it costs a pair of comparisons.
+	if (KnockVelocity.IsNearlyZero() && KnockOffset.IsNearlyZero())
+	{
+		return;
+	}
+
+	KnockOffset += KnockVelocity * DeltaTime;
+
+	// Both die away over the recovery time: the speed, so that a throw is a shove and not a launch, and
+	// the offset, so that the animation gets its blade back.
+	const float Fade = FMath::Clamp(DeltaTime / FMath::Max(0.01f, HexenCollisionGuardKnockRecoverySeconds), 0.f, 1.f);
+	KnockVelocity -= KnockVelocity * Fade;
+	KnockOffset -= KnockOffset * Fade;
+
+	const float MaxOffset = FMath::Max(0.f, HexenCollisionGuardMaxKnockOffset);
+	if (KnockOffset.SizeSquared() > FMath::Square(MaxOffset))
+	{
+		KnockOffset = KnockOffset.GetSafeNormal() * MaxOffset;
+	}
+
+	// Settled. Cleared outright rather than left creeping towards zero, so the test above can keep
+	// costing nothing for the rest of the match.
+	if (KnockOffset.SizeSquared() < 0.01f && KnockVelocity.SizeSquared() < 1.f)
+	{
+		KnockOffset = FVector::ZeroVector;
+		KnockVelocity = FVector::ZeroVector;
+	}
+}
+
 void UHexenCombatComponent::UpdateHexenCollisionGuard()
 {
 	const USkeletalMeshComponent* Mesh = GetOwnerMesh();
@@ -1351,7 +1536,7 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 	const bool bAuthority = GetOwner() && GetOwner()->HasAuthority();
 
 	// A hold that arrived before the swing it is about had nothing to hold. Two bools a tick to catch up with it.
-	if (!bAuthority && bServerSwingHeld && !PausedMontage.IsValid())
+	if (!bAuthority && bServerSwingHeld && !IsHoldingSwing())
 	{
 		ApplyServerSwingHold();
 	}
@@ -1376,6 +1561,12 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 			break;
 		}
 	}
+
+	// Which frame this fighter last ran a guard update on, so a pair record can tell "a frame ago" from
+	// "some time ago" - see UpdateCollisionPair. Read before it is moved on, and moved on whether or not
+	// a partner turns up: no partner this tick is exactly the case the pair record must not survive.
+	const uint64 PreviousGuardFrame = LastGuardFrame;
+	LastGuardFrame = GFrameCounter;
 
 	FHexenCollisionGuardInput In;
 	bool bValid = false;
@@ -1427,7 +1618,7 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 			// drawn blade minus the partner's correction stands in - which was 10-45 cm off in practice.
 			const UHexenCombatComponent* TheirFighter = TheirVolume->GetFighter();
 			FTransform TheirAnimatedHand;
-			if (!TheirFighter || !TheirFighter->GetHexenCollisionGuardAnimatedPose(In.PartnerAxisStartWorld, In.PartnerAxisEndWorld, TheirAnimatedHand))
+			if (!TheirFighter || !TheirFighter->GetHexenCollisionGuardActingPose(In.PartnerAxisStartWorld, In.PartnerAxisEndWorld, TheirAnimatedHand))
 			{
 				const FVector TheirCorrection = TheirFighter ? TheirFighter->GetHexenCollisionGuardCorrectionWorld() : FVector::ZeroVector;
 				In.PartnerAxisStartWorld = TheirStart - TheirCorrection;
@@ -1438,7 +1629,7 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 			// One decision for the pair - which way apart, and whether the blades went through - taken by
 			// whichever fighter ticks first this frame and read by the other. Two fighters deciding for
 			// themselves could, and did, end up pushing the same way and dragging each other along.
-			FHexenCollisionPair& Pair = UpdateCollisionPair(MyVolume, TheirVolume, HexenCollisionGuardSkin, HexenCollisionGuardSweepSteps, bHexenCollisionGuardRigPoseOverlap, bAuthority, bLogContactSteps);
+			FHexenCollisionPair& Pair = UpdateCollisionPair(MyVolume, TheirVolume, HexenCollisionGuardSkin, HexenCollisionGuardSweepSteps, bHexenCollisionGuardRigPoseOverlap, bAuthority, bLogContactSteps, PreviousGuardFrame, bHexenCollisionGuardResetStalePair);
 
 			// Winding a swing back and holding it there is a hold like any other, so it is the server's to make. A
 			// client gets the same pose by being told the montage time to wind to - see ApplyServerSwingHold.
@@ -1450,7 +1641,7 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 				// rather than through it.
 				bRewound = RewindSwingToTouch(Pair.TouchAlpha, TEXT("SWEEP touch"));
 			}
-			else if (bAuthority && bRetryingHeldSwing && !PausedMontage.IsValid())
+			else if (bAuthority && bRetryingHeldSwing && !IsHoldingSwing())
 			{
 				// A swing let go to try again that presses on into the blade it was held against is held again.
 				// Pressing on is depth along the pair's direction, so a swing that went right through within the
@@ -1477,6 +1668,30 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 				// A partner that ticked first this frame has already read them, and pushes one frame by the undone decision.
 				Pair.Side = Pair.SideBefore;
 				Pair.bCrossed = Pair.bCrossedBefore;
+				Pair.bCrossedOnSweepAlone = false;
+			}
+			else if (bAuthority && Pair.bCrossedOnSweepAlone)
+			{
+				// A crossing that only the sweep saw, and no swing wound back to the meeting it found. So the blades
+				// never come to the touching pose, no overlap ever begins, and a state that is only left when an
+				// overlap ends could never be left. What is left of the same flip is its other reading: round a tip,
+				// with the direction following the blades.
+				//
+				// Cleared as it is consumed, so that the fighter which did not decide the pair cannot undo this
+				// fighter's work when it ticks later in the same frame.
+				Pair.bCrossedOnSweepAlone = false;
+				Pair.bCrossed = false;
+				Pair.Side = Pair.SweepFallbackSide;
+				MyVolume->SetPairCrossed(false);
+				TheirVolume->SetPairCrossed(false);
+
+#if !UE_BUILD_SHIPPING
+				if (bLogContactSteps)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[GUARD] %s srv f%llu FLIP undone - the sweep's meeting was never wound back to, so it cannot have been a crossing: taken as round a tip"),
+						*GetNameSafe(GetOwner()), (unsigned long long)GFrameCounter);
+				}
+#endif
 			}
 
 			// Off, neither goes to the rig, which then pushes along the shortest way out on its own - see
@@ -1487,8 +1702,97 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 				In.bPairCrossed = Pair.bCrossed;
 			}
 
+			// How much of the overlap THIS blade gives way by. Not a fixed half: the two blades are not
+			// equally movable where they happen to have met, and a half each is the one answer that is
+			// certainly wrong whenever they are not. The weaker side takes the whole of it and the
+			// stronger side keeps its line - which is what a bind looks like.
+			//
+			// Worked out here, every frame, rather than taken from the contact's replicated record: a bind
+			// slides along both blades, the lever arms slide with it, and a share fixed at the first frame
+			// would be wrong by the second. It is a measurement of this frame's pose, so each machine makes
+			// it for itself, like the depth and the direction it goes with - nothing new goes over the wire.
+			//
+			// In the animated pose throughout, with the animated hands as the pivots: the partner's axis
+			// already is the animated one, and mixing in a drawn pivot would feed the known rig-to-mesh
+			// discrepancy straight into the share.
 			In.Share = HexenCollisionGuardShare;
+			if (bHexenCollisionGuardBalancedShare)
+			{
+				FVector MyAnimStart, MyAnimEnd;
+				FTransform MyAnimHand;
+				if (GetHexenCollisionGuardActingPose(MyAnimStart, MyAnimEnd, MyAnimHand))
+				{
+					FVector OnMine, OnTheirs;
+					FMath::SegmentDistToSegmentSafe(MyAnimStart, MyAnimEnd, In.PartnerAxisStartWorld, In.PartnerAxisEndWorld, OnMine, OnTheirs);
+
+					// The partner's hand is only known when its rig has published a pose; its weapon's own pivot
+					// stands in until then, which is the same socket a frame stale rather than a different place.
+					const FVector TheirPivot = TheirAnimatedHand.Equals(FTransform::Identity) ? TheirVolume->GetPivotWorld() : TheirAnimatedHand.GetLocation();
+					In.Share = MyVolume->GetYieldFractionAgainst(TheirVolume, MyAnimHand.GetLocation(), OnMine, TheirPivot, OnTheirs);
+				}
+			}
+
+			// And how much further than the overlap the yielding blade goes. Only the yielding side: the
+			// winner keeps its line, and multiplying its part too would push it off the line by the very
+			// exchange it won. Evenly matched, both sides sit at a half and this is exactly one, so a bind
+			// is untouched.
+			In.Overdrive = (In.Share > 0.5f)
+				? 1.f + FMath::Max(0.f, HexenCollisionGuardOverdrive) * (2.f * In.Share - 1.f)
+				: 1.f;
+
+			// Take the chain off the animation while the animation itself says the blades are together, and
+			// give it back when the animation would have them apart. The animation is still played, still
+			// blended and still measured - it just stops reaching these bones, which is what makes this
+			// work for a shoulder walked into a shoulder as much as for a swing.
+			//
+			// Captured from the ANIMATED hand of the frame the two first come together, so the hold starts
+			// from the pose the animation asked for rather than from one the guard had already pushed. Held
+			// in the rig's space, which is the mesh's, so it travels with the body: walk, and the blade goes
+			// with you - and the guard, which runs every frame on top of this, resolves whatever that walk
+			// drives it into.
+			if (bHexenCollisionGuardHoldChain)
+			{
+				// Result is the rig's last evaluation, read under the lock at the top of this function.
+				//
+				// Taken when the animation has carried the blade to the far side of the other one, given back
+				// only once it is clear on its own side. Two different thresholds on purpose: one would sit
+				// the state on a sign change and flicker there, and every flicker hands the chain back to an
+				// animation that is past the other blade - which is the blade jumping through.
+				if (!bHoldingChain && Result.bAnimationThroughPartner)
+				{
+					bHoldingChain = true;
+					HeldHandRig = Result.AnimatedHandRig;
+#if !UE_BUILD_SHIPPING
+					if (bLogContactSteps)
+					{
+						UE_LOG(LogTemp, Warning, TEXT("[HOLD] %s %s f%llu TOOK the chain - the animation wants this blade THROUGH the other one | hand in mesh space %s"),
+							*GetNameSafe(GetOwner()), bAuthority ? TEXT("srv") : TEXT("cli"), (unsigned long long)GFrameCounter,
+							*HeldHandRig.GetLocation().ToCompactString());
+					}
+#endif
+				}
+				else if (bHoldingChain && Result.bAnimationClearOfPartner)
+				{
+					bHoldingChain = false;
+#if !UE_BUILD_SHIPPING
+					if (bLogContactSteps)
+					{
+						UE_LOG(LogTemp, Warning, TEXT("[HOLD] %s %s f%llu GAVE the chain back - the animation is clear on its own side again"),
+							*GetNameSafe(GetOwner()), bAuthority ? TEXT("srv") : TEXT("cli"), (unsigned long long)GFrameCounter);
+					}
+#endif
+				}
+			}
+			else
+			{
+				bHoldingChain = false;
+			}
+
+			In.bHasHeldHand = bHoldingChain;
+			In.HeldHandRig = HeldHandRig;
+
 			In.Skin = HexenCollisionGuardSkin;
+			In.KnockOffsetWorld = KnockOffset;
 			bValid = true;
 		}
 		else if (bAuthority)
@@ -1562,12 +1866,14 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 			// One line per frame while the guard is pushing, and one when it lets go. A depth that keeps
 			// growing while the correction keeps pace is a blade being held off; a correction of zero with a
 			// depth above zero would be the guard not reaching the rig at all.
-			UE_LOG(LogTemp, Warning, TEXT("[GUARD] %s %s f%llu %s%s%s | depth %.1fcm | drawn gap %s | correction %.1fcm | normal %s | at %.0fcm from hand%s%s"),
+			UE_LOG(LogTemp, Warning, TEXT("[GUARD] %s %s f%llu %s%s%s%s | depth %.1fcm | share %.2f x%.2f | drawn gap %s | correction %.1fcm | normal %s | at %.0fcm from hand%s%s"),
 				*GetNameSafe(GetOwner()), *Side, (unsigned long long)GFrameCounter,
 				Result.bPenetrating ? (bGuardWasPushing ? TEXT("push") : TEXT("START")) : TEXT("END"),
 				Result.bCrossed ? TEXT(" CROSSED") : TEXT(""),
 				bHexenCollisionGuardPairDecision ? TEXT("") : TEXT(" NOPAIR"),
+				bHoldingChain ? TEXT(" HELD") : TEXT(""),
 				Result.Depth,
+				In.Share, In.Overdrive,
 				bHaveDrawnGap
 					? (bHavePreviousDrawnGap
 						? *FString::Printf(TEXT("%.1fcm, was %.1fcm a frame before"), DrawnGap, PreviousDrawnGap)
@@ -1624,16 +1930,16 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 			// under a partly weighted montage. The mesh in the world: movement there is the fighter. And how far the
 			// partner's estimate of this blade - drawn minus correction - is from where the animation had it, at each
 			// end: an error there goes straight into the partner's push.
-			const float EstErrStart = bHaveMyAxis ? FVector::Dist(MyStart - Result.CorrectionWorld, Result.AnimatedAxisStartWorld) : -1.f;
-			const float EstErrEnd = bHaveMyAxis ? FVector::Dist(MyEnd - Result.CorrectionWorld, Result.AnimatedAxisEndWorld) : -1.f;
+			const float EstErrStart = bHaveMyAxis ? FVector::Dist(MyStart - Result.CorrectionWorld, Result.ActingAxisStartWorld) : -1.f;
+			const float EstErrEnd = bHaveMyAxis ? FVector::Dist(MyEnd - Result.CorrectionWorld, Result.ActingAxisEndWorld) : -1.f;
 			const FVector MeshLocation = Mesh->GetComponentLocation();
 
 			// And the cause of that error: whether the hand is drawn where the rig put it - the animated hand plus the
 			// correction, its rotation kept - and how many frames old the rig's result is. A result from an earlier
 			// frame means the pose was not evaluated this frame.
 			const FTransform DrawnHand = Mesh->GetSocketTransform(HandBoneName, RTS_World);
-			const float HandOffRig = Result.bHasAnimatedPose ? FVector::Dist(DrawnHand.GetLocation(), Result.AnimatedHandWorld.GetLocation() + Result.CorrectionWorld) : -1.f;
-			const float HandTurnOffRig = Result.bHasAnimatedPose ? FMath::RadiansToDegrees(DrawnHand.GetRotation().AngularDistance(Result.AnimatedHandWorld.GetRotation())) : -1.f;
+			const float HandOffRig = Result.bHasActingPose ? FVector::Dist(DrawnHand.GetLocation(), Result.ActingHandWorld.GetLocation() + Result.CorrectionWorld) : -1.f;
+			const float HandTurnOffRig = Result.bHasActingPose ? FMath::RadiansToDegrees(DrawnHand.GetRotation().AngularDistance(Result.ActingHandWorld.GetRotation())) : -1.f;
 			const uint64 RigAge = GFrameCounter >= Result.EvaluationFrame ? GFrameCounter - Result.EvaluationFrame : 0;
 
 			// Where this machine's copy of the swing has got to. Two machines standing at different points of the same
@@ -1650,7 +1956,7 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 
 			UE_LOG(LogTemp, Warning, TEXT("[DRIFT] %s %s f%llu %s | montage %.3f | handCS %.1f %.1f %.1f | mesh %.1f %.1f %.1f yaw %.1f | estErr %.1f/%.1fcm | axisDepth %.1fcm | drawn hand off rig %.1fcm %.1fdeg | rig age %llu"),
 				*GetNameSafe(GetOwner()), *Side, (unsigned long long)GFrameCounter,
-				PausedMontage.IsValid() ? TEXT("held") : (bRetryingHeldSwing ? TEXT("retry") : TEXT("free")),
+				IsHoldingSwing() ? TEXT("held") : (bRetryingHeldSwing ? TEXT("retry") : TEXT("free")),
 				MontageAt,
 				Result.AnimatedHandComponent.X, Result.AnimatedHandComponent.Y, Result.AnimatedHandComponent.Z,
 				MeshLocation.X, MeshLocation.Y, MeshLocation.Z, Mesh->GetComponentRotation().Yaw,
@@ -1665,13 +1971,13 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 			// offsets do not, so the drawn hand stands 8-12 cm away from the rig's whatever the guard does - see the
 			// [LOCAL] line and question 7. That standing error is in the hand's figure below and not in the turn's,
 			// which is the same local contact offset turned by the two rotations and nothing else.
-			if (Result.bHasAnimatedPose && Result.bPenetrating && !Result.CorrectionWorld.IsNearlyZero())
+			if (Result.bHasActingPose && Result.bPenetrating && !Result.CorrectionWorld.IsNearlyZero())
 			{
 				const FVector Wanted = Result.CorrectionWorld;
 				const FVector WantedDir = Wanted.GetSafeNormal();
-				const FVector ContactInHand = Result.AnimatedHandWorld.InverseTransformPosition(Result.AnimatedContactWorld);
-				const FVector ByTurn = DrawnHand.GetRotation().RotateVector(ContactInHand) - Result.AnimatedHandWorld.GetRotation().RotateVector(ContactInHand);
-				const FVector ByHand = DrawnHand.GetLocation() - Result.AnimatedHandWorld.GetLocation();
+				const FVector ContactInHand = Result.ActingHandWorld.InverseTransformPosition(Result.ActingContactWorld);
+				const FVector ByTurn = DrawnHand.GetRotation().RotateVector(ContactInHand) - Result.ActingHandWorld.GetRotation().RotateVector(ContactInHand);
+				const FVector ByHand = DrawnHand.GetLocation() - Result.ActingHandWorld.GetLocation();
 				const float Asked = Wanted.Size();
 				const float TurnAlong = FVector::DotProduct(ByTurn, WantedDir);
 				const float HandAlong = FVector::DotProduct(ByHand, WantedDir);
@@ -1873,7 +2179,7 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 			const FBodyInstance* HandBody = Mesh->GetBodyInstance(HandBoneName);
 			UE_LOG(LogTemp, Warning, TEXT("[CHAIN] %s %s f%llu %s | cm/deg:%s | mesh vs rig world %.1fcm %.1fdeg scale %.2f/%.2f | phys blend %d sim %d spine %.2f hand %.2f"),
 				*GetNameSafe(GetOwner()), *Side, (unsigned long long)GFrameCounter,
-				PausedMontage.IsValid() ? TEXT("held") : (bRetryingHeldSwing ? TEXT("retry") : TEXT("free")),
+				IsHoldingSwing() ? TEXT("held") : (bRetryingHeldSwing ? TEXT("retry") : TEXT("free")),
 				*ChainReport,
 				FVector::Dist(MeshToWorld.GetLocation(), Result.RigToWorld.GetLocation()),
 				FMath::RadiansToDegrees(MeshToWorld.GetRotation().AngularDistance(Result.RigToWorld.GetRotation())),
@@ -1927,13 +2233,74 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 	if (bAuthority && bPauseMontageOnContact && HexenCollisionGuardPauseSeconds > 0.f && World)
 	{
 		const double Now = World->GetTimeSeconds();
-		if (Result.bPenetrating && !bGuardWasPushing && !PausedMontage.IsValid())
+
+		// This blade has been thrown out of the way and nothing is pushing it any more - see the release below.
+		const bool bThrownClear = !Result.bPenetrating && KnockOffset.SizeSquared() > FMath::Square(5.f);
+		// Not held when this fighter is winning the bind outright. Holding every swing that touches anything
+		// is what makes a decisive blow feel like a wall: the stronger fighter sweeps the other blade aside
+		// and then stands still, because the contact stopped his montage like any other. A fighter giving way
+		// by less than HoldMaxShare is not being resisted in any meaningful sense, so there is nothing to
+		// stop - and that is mal pare. Evenly matched, both sit at a half and both are held, so a bind is
+		// untouched.
+		const bool bWinningOutright = In.Share < HexenCollisionGuardHoldMaxShare;
+
+		// Whether a swing has STARTED since the last tick. A contact has exactly one frame where the guard
+		// begins to push, and a swing pressed after that frame has no such frame of its own - so without
+		// this the only thing that could have stopped it was the sweep, and the sweep does not run while the
+		// blades are already touching. Which is the whole of "press attack in a bind and it goes through".
+		const USkeletalMeshComponent* SwingMesh = GetOwnerMesh();
+		UAnimInstance* SwingAnim = SwingMesh ? SwingMesh->GetAnimInstance() : nullptr;
+		UAnimMontage* SwingActive = SwingAnim ? SwingAnim->GetCurrentActiveMontage() : nullptr;
+		const FAnimMontageInstance* SwingInstanceNow = (SwingAnim && SwingActive) ? SwingAnim->GetActiveInstanceForMontage(SwingActive) : nullptr;
+		const int32 SwingInstanceID = SwingInstanceNow ? SwingInstanceNow->GetInstanceID() : INDEX_NONE;
+		const bool bSwingJustStarted = SwingInstanceID != INDEX_NONE && SwingInstanceID != LastSeenSwingInstanceID;
+		LastSeenSwingInstanceID = SwingInstanceID;
+
+#if !UE_BUILD_SHIPPING
+		// Why a swing was or was not stopped this frame. Printed on the frame a contact starts, and again
+		// whenever a NEW swing appears while one is already in progress - which is exactly the case of
+		// pressing attack again mid-contact, and the one place a wall of lines would otherwise hide the
+		// answer. Three guesses have already been spent on this mechanism without a line saying what it
+		// did; this is that line.
+		if (bLogContactSteps && bAuthority && Result.bPenetrating)
+		{
+			// The held pointer is to the montage ASSET, which never dies, so IsValid() stays true long after
+			// the instance it was taken from has been replaced. Whether the hold is still live is the
+			// instance's question, and that is what this reports separately.
+			const bool bHeldInstanceStillActive = PausedMontage.IsValid() && SwingInstanceNow && SwingInstanceID == PausedMontageInstanceID;
+
+			// Reported from exactly the values the gate below uses, so the line cannot be optimistic about a
+			// condition the gate also checks - which is how "will be held" was printed for swings the gate
+			// then refused because the guard was already pushing.
+			if (!bGuardWasPushing || bSwingJustStarted)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[NOHOLD] %s srv f%llu %s | playing %s inst %d | held ptr %s inst %d%s | share %.2f%s | verdict %s"),
+					*GetNameSafe(GetOwner()), (unsigned long long)GFrameCounter,
+					bSwingJustStarted ? (bGuardWasPushing ? TEXT("NEW SWING mid-contact") : TEXT("NEW SWING at contact START")) : TEXT("contact START"),
+					*GetNameSafe(SwingActive), SwingInstanceID,
+					PausedMontage.IsValid() ? *GetNameSafe(PausedMontage.Get()) : TEXT("none"), PausedMontageInstanceID,
+					PausedMontage.IsValid() ? (bHeldInstanceStillActive ? TEXT(" (live)") : TEXT(" (STALE - that instance is gone)")) : TEXT(""),
+					In.Share, bWinningOutright ? TEXT(" WINNING - hold forbidden") : TEXT(""),
+					!SwingActive ? TEXT("nothing to hold")
+						: bWinningOutright ? TEXT("left free on purpose")
+						: bHeldInstanceStillActive ? TEXT("already held - nothing to do")
+						: TEXT("WILL BE HELD"));
+			}
+		}
+#endif
+
+		if (Result.bPenetrating && (!bGuardWasPushing || bSwingJustStarted) && !IsHoldingSwing() && !bWinningOutright)
 		{
 			PauseCurrentMontage();
 			GuardPauseStartTime = Now;
 			PublishSwingHold(true);
 		}
-		else if (PausedMontage.IsValid() && Now - GuardPauseStartTime >= HexenCollisionGuardPauseSeconds)
+		// Or at once, when a clash has thrown this blade clear of the other. That is not the overlap blinking
+		// on the touching threshold - which is the only thing the wait is there to sit out - it is a real gap
+		// that a real impulse put there, and sitting out the rest of the half second would freeze the swing
+		// through most of a cut and then jerk it on. The check below still has to agree that the way is clear
+		// before anything is let go, so this can only make the release sooner, never wronger.
+		else if (PausedMontage.IsValid() && (Now - GuardPauseStartTime >= HexenCollisionGuardPauseSeconds || bThrownClear))
 		{
 			// Let go only once the contact is over: this blade no longer overlaps another fighter's. The guard holds
 			// the blades a hair inside touching, so the overlap lasts exactly as long as the other blade stays in the way.
@@ -2016,7 +2383,7 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 
 	// The blades the swing was let go against have come apart: nothing left to press on into, and the swing is free.
 	// A swing that went through them instead has already been held again above.
-	if (bRetryingHeldSwing && !PausedMontage.IsValid() && !Result.bPenetrating)
+	if (bRetryingHeldSwing && !IsHoldingSwing() && !Result.bPenetrating)
 	{
 		bRetryingHeldSwing = false;
 
@@ -2065,7 +2432,7 @@ void UHexenCombatComponent::UpdateHexenCollisionGuard()
 bool UHexenCombatComponent::RewindSwingToTouch(float Alpha, const TCHAR* Cause)
 {
 	UWorld* World = GetWorld();
-	if (!bPauseMontageOnContact || PausedMontage.IsValid() || !World)
+	if (!bPauseMontageOnContact || IsHoldingSwing() || !World)
 	{
 		return false;
 	}

@@ -30,6 +30,29 @@ struct FHexenCollisionGuardInput
 	float Skin = 0.f;
 
 	/**
+	 * What the yielding side's part of the overlap is multiplied by, so that it is driven CLEAR of the
+	 * other blade rather than merely to the touching line. One on the winning side - see
+	 * UHexenCombatComponent::HexenCollisionGuardOverdrive.
+	 */
+	float Overdrive = 1.f;
+
+	/**
+	 * The hand this blade is HELD in while the contact owns the chain, in the rig's own space - which is
+	 * the mesh's, so it travels with the body and not with the animation.
+	 *
+	 * This is what takes the chain out of the animation: while it is set, the blade is built from this
+	 * hand instead of the animated one, and whatever the animation does with the arm - a second swing, a
+	 * stance, anything - does not reach the blade. The guard still pushes on top of it every frame, so a
+	 * body that walks its held blade into another one is still resolved. See
+	 * UHexenCombatComponent::bHexenCollisionGuardHoldChain.
+	 */
+	bool bHasHeldHand = false;
+	FTransform HeldHandRig = FTransform::Identity;
+
+	/** Where the last clash threw this blade, in the world. Added to the correction, and applied even with nothing overlapping - see UHexenCombatComponent::IntegrateKnock. */
+	FVector KnockOffsetWorld = FVector::ZeroVector;
+
+	/**
 	 * The direction to push this blade in, in the world. One decision for the pair, the same for both
 	 * fighters with opposite signs - see UHexenCombatComponent::UpdateHexenCollisionGuard.
 	 */
@@ -72,17 +95,44 @@ struct FHexenCollisionGuardResult
 	 * pose differs from what the rig puts out somewhere after the rig. False until the rig has run with a partner
 	 * in range.
 	 */
-	bool bHasAnimatedPose = false;
-	FTransform AnimatedHandWorld = FTransform::Identity;
-	FVector AnimatedAxisStartWorld = FVector::ZeroVector;
-	FVector AnimatedAxisEndWorld = FVector::ZeroVector;
+	bool bHasActingPose = false;
+	FTransform ActingHandWorld = FTransform::Identity;
+
+	/**
+	 * The hand the ANIMATION asked for this frame, in the rig's own space - the mesh's. What the hold is
+	 * captured from when a contact takes the chain, and the one pose that has to be kept in mesh space
+	 * rather than in the world, so the held blade travels with the body.
+	 */
+	FTransform AnimatedHandRig = FTransform::Identity;
+
+	/**
+	 * Which side of the partner's blade the pose the ANIMATION asked for would put this one on, as two
+	 * questions along the pair's own direction.
+	 *
+	 * A SIDE and not a distance, and that is the third shape this rule has taken. "Are the animated poses
+	 * still touching" took the chain away on every contact, which broke the ordinary push that was working;
+	 * and whether it was measured as a plain distance or along the axis, it flickered - holds ran a median
+	 * of two to four frames, and every release handed the chain back to an animation that was by then past
+	 * the other blade, so the blade jumped there.
+	 *
+	 * What actually matters is whether the animation is trying to put this blade THROUGH the other one. If
+	 * it is, nothing but taking the chain away will stop it. If it is not - even pressed hard against it -
+	 * the ordinary correction handles it, and the animation should keep the chain.
+	 *
+	 * Two thresholds rather than one, so the state has somewhere to sit: taken when the animation has
+	 * crossed to the far side, given back only once it is clear on its own side.
+	 */
+	bool bAnimationThroughPartner = false;
+	bool bAnimationClearOfPartner = false;
+	FVector ActingAxisStartWorld = FVector::ZeroVector;
+	FVector ActingAxisEndWorld = FVector::ZeroVector;
 
 	/**
 	 * The spot on this blade's axis that touches the partner's, in the world, in the animated pose - the one point
 	 * the guard asks the rig to move. The split log holds the drawn pose against it to see what delivered the
 	 * correction, the arm or the wrist - see the [SPLIT] line in UpdateHexenCollisionGuard.
 	 */
-	FVector AnimatedContactWorld = FVector::ZeroVector;
+	FVector ActingContactWorld = FVector::ZeroVector;
 
 	/**
 	 * For the drift log: the animated hand in the mesh's own space, and GFrameCounter when the rig produced this
@@ -327,7 +377,7 @@ public:
      * of lines rather than a wall of them.
      */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Debug")
-    bool bLogContactSteps = false;
+    bool bLogContactSteps = true;
 
     /** Draws the two rig points and prints the figures. The tick it needs is already running while a contact holds, so this costs only the drawing. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Debug")
@@ -388,9 +438,131 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard")
     bool bUseHexenCollisionGuard = true;
 
-    /** This fighter's part of an overlap, 0..1. Two fighters at a half each resolve it exactly between them. */
+    /**
+     * Whether the bones a contact runs through stop taking the animation for as long as it lasts.
+     *
+     * On, the blade is built from the hand it was HELD in when the contact began, kept in the mesh's
+     * space, and the guard pushes on top of that every frame. The animation goes on playing and goes on
+     * being measured - it is what says when the contact is over - but it does not reach the blade. A
+     * second swing pressed in mid-bind plays, blends and moves the body, and the blade stays where it is,
+     * with no "am I attacking" flag anywhere. Which is the point: a flag like that knows about swings, and
+     * a shoulder pressed against a shoulder is a contact too, with no swing behind it.
+     *
+     * OFF for now, and the reason is measured. As built, the hold captures the animated hand once and
+     * never updates it: the blade is rebuilt from that same frozen hand every frame, while the correction
+     * goes to the solver's target and is never written back into the held pose. So the guard measures its
+     * depth against a blade that is no longer where the blade is, the partner measures against the same
+     * frozen pose through ActingAxis*, and both reason about geometry nobody is looking at. On the 10-04
+     * run that showed up plainly: 2266 of 5020 pushing frames had the drawn capsules 15-40 cm inside one
+     * another, against 0 such frames before the hold existed and 93% of frames sitting at the touching
+     * line where they belong.
+     *
+     * What it needs is to hold the RESOLVED pose rather than the captured one - the held hand advanced each
+     * frame by whatever the contact moved it by - so that it is "the pose the contact is driving" and not
+     * "a pose frozen once".
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard")
+    bool bHexenCollisionGuardHoldChain = false;
+
+    /**
+     * Whether a pair record that was not touched on this fighter's previous tick is started over.
+     *
+     * On, a pair that went out of range and came back is treated as new, because everything in the record
+     * - the previous poses the sweep runs from, the remembered side, whether an overlap was in progress -
+     * describes a moment that can be seconds and metres away. Off, the record is read as though one frame
+     * had passed, which is what happened before 09-26.
+     *
+     * A switch because the two readings have to be told apart by a run rather than by argument: it is a
+     * candidate for the blades passing through, and the way to settle that is to turn it off and look.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard")
+    bool bHexenCollisionGuardResetStalePair = true;
+
+    /**
+     * Whether the share of an overlap each blade takes comes from the contact balance - which blade is
+     * harder to move where the two have met - rather than being the same for both.
+     *
+     * On, the weaker side takes the whole of the overlap and the stronger keeps its line; off, both give
+     * way by HexenCollisionGuardShare, which is what happened before the balance existed. Kept as a
+     * switch to feel the difference, and because it is the one thing that changes the picture.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard")
+    bool bHexenCollisionGuardBalancedShare = true;
+
+    /** This fighter's part of an overlap, 0..1, when the balance is switched off or has nothing to go on. Two fighters at a half each resolve it exactly between them. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0", ClampMax = "1"))
     float HexenCollisionGuardShare = 0.5f;
+
+    /**
+     * How much further than the overlap the YIELDING blade is driven, at the point where one side loses
+     * the balance outright. Zero leaves it exactly on the touching line.
+     *
+     * This is the "more than the penetration depth" the whole mechanism was missing. Two shares that add
+     * to one resolve an overlap and no more, which is a bind: both blades end up touching, neither is
+     * anywhere it was not already. A blade that LOSES a bind does not stop at touching - it is driven out
+     * of the way, and the blade that won carries on along its line. So the loser's part is multiplied by
+     * 1 + this * (2 * share - 1): nothing when the two are evenly matched, the full amount when one side
+     * has no say at all. The winning side is never multiplied, or it would be pushed off its own line by
+     * the very exchange it won.
+     *
+     * The two parts then add to more than the overlap on purpose: the blades come apart, which is what
+     * mal pare looks like and what ends the contact.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0"))
+    float HexenCollisionGuardOverdrive = 1.f;
+
+    /**
+     * The share below which a fighter is winning the bind outright, and his swing is NOT held.
+     *
+     * Holding every swing that touches anything is what makes a decisive blow feel like a wall: the
+     * stronger fighter sweeps the other blade aside and then stands there, because the contact stopped
+     * his montage like any other. A fighter who is giving way by less than this much is not being
+     * resisted in any meaningful sense, so there is nothing to stop. Evenly matched, both sides sit at a
+     * half, both are held, and the blades bind - which is the behaviour this must not break.
+     *
+     * Set to 0 to hold every swing, as before.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0", ClampMax = "0.5"))
+    float HexenCollisionGuardHoldMaxShare = 0.35f;
+
+    /**
+     * Whether a clash throws the blades apart at all.
+     *
+     * OFF, and parked. As first built the throw came from the closing speed carried forward as a free
+     * flight, and on the 09-26 run that meant every single touch saturated its own cap: a tip meeting a
+     * blade at 16.7 m/s gives 1520 cm/s of it, which is 50 cm in one frame at 30 fps against a cap of 25.
+     * Both blades were flung a quarter of a metre apart on contact, the gap read as "the way is clear",
+     * the held swings were let go at once, and the blades sailed through one another. It also threw an
+     * EVEN bind apart - a yield of 0.53 threw as hard as a beat of 0.91 - which is precisely backwards:
+     * an even meeting is what a bind IS.
+     *
+     * What it needs is a magnitude taken from the overlap rather than from the speed, so that it is a
+     * shove measured in centimetres of penetration and not a launch measured in metres per second.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard")
+    bool bHexenCollisionGuardKnock = false;
+
+    /**
+     * How much of the closing speed comes back as a bounce when two blades meet. 0 is a dead clash - the
+     * struck blade is swept up to the other's speed and no further; 1 would throw it back as fast as it
+     * came. The impulse itself does not vanish at 0: it is what carries the weaker blade out of the way.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0", ClampMax = "1"))
+    float HexenCollisionGuardKnockRestitution = 0.f;
+
+    /** How long the blade takes to come back to its animation after a clash has thrown it, in seconds. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0.01"))
+    float HexenCollisionGuardKnockRecoverySeconds = 0.25f;
+
+    /**
+     * How far a clash is allowed to throw a blade, in cm.
+     *
+     * The physics of a light blade struck by a heavy one says it flies, and it is right - what actually
+     * stops it is the arm, the shoulder and the fighter hauling it back, none of which is modelled. This
+     * cap is that missing half, admitted rather than hidden, and it is the first knob to turn on feel.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Guard", meta = (ClampMin = "0"))
+    float HexenCollisionGuardMaxKnockOffset = 25.f;
 
     /**
      * How far inside touching, in cm, the guard leaves the two capsules.
@@ -531,8 +703,8 @@ public:
      */
     bool GetServerPoseForRig(TArray<FName>& OutBones, TArray<FTransform>& OutPose) const;
 
-    /** Where this fighter's animation had its blade and hand in the last evaluation, in world space - see FHexenCollisionGuardResult::bHasAnimatedPose. False until the rig has published one. */
-    bool GetHexenCollisionGuardAnimatedPose(FVector& OutStart, FVector& OutEnd, FTransform& OutHand) const;
+    /** Where this fighter's animation had its blade and hand in the last evaluation, in world space - see FHexenCollisionGuardResult::bHasActingPose. False until the rig has published one. */
+    bool GetHexenCollisionGuardActingPose(FVector& OutStart, FVector& OutEnd, FTransform& OutHand) const;
 
     /** The hand the weapon is held in, as drawn, in world space. Game thread. */
     bool GetHandTransformWorld(FTransform& Out) const;
@@ -553,6 +725,20 @@ protected:
 
     /** Pauses whatever montage is playing and remembers it. Logs when there is none to pause. */
     void PauseCurrentMontage();
+
+    /**
+     * Whether the swing this component is holding is still the one playing.
+     *
+     * Not the same question as PausedMontage.IsValid(), and that difference was worth ten swings on the
+     * 10-04 run. The held pointer is to the montage ASSET, which never dies, so it reads as valid long
+     * after the instance it was taken from has been replaced - and a new swing pressed mid-contact starts a
+     * NEW instance. Every path that stops a swing was gated on the asset pointer, so the first hold of a
+     * contact blocked every hold after it until the half-second release check came round. The new swing was
+     * stopped by nothing and went straight through, which is exactly what was being reported.
+     *
+     * The instance is the thing that can actually be held, and PausedMontageInstanceID already records it.
+     */
+    bool IsHoldingSwing() const;
 
     /** Pauses Montage and holds its blend weight at Weight, remembering the instance so ResumePausedMontage can let both go. */
     void HoldMontage(UAnimInstance* AnimInstance, UAnimMontage* Montage, float Weight);
@@ -585,6 +771,55 @@ protected:
 
     /** Game thread, every frame while the guard is on: finds this fighter's blade and the nearest other one, and publishes what the rig needs. */
     void UpdateHexenCollisionGuard();
+
+public:
+    /**
+     * Server-side. A clash has thrown this fighter's blade: works the impulse out and starts the throw.
+     *
+     * Called once, when the two volumes meet, by the side reporting the contact - so each fighter gets
+     * its own, from its own effective mass. The heavy side's share of the same impulse is its recoil,
+     * which comes out small for free rather than being a second rule.
+     */
+    void ApplyContactKnock(const FVector& NormalWorld, float ClosingSpeedCmS, float MyResistance, float TheirResistance);
+
+protected:
+    /** Carries the throw forward one frame and lets it die away. Runs on every machine: the impulse is replicated as an event, the decay each machine works out for itself. */
+    void IntegrateKnock(float DeltaTime);
+
+    /** Where the throw has this blade now, in the world, and how fast it is still going. Local to each machine - see IntegrateKnock. */
+    FVector KnockOffset = FVector::ZeroVector;
+    FVector KnockVelocity = FVector::ZeroVector;
+
+    /** The frame this fighter last ran UpdateHexenCollisionGuard on. A pair record stamped with anything else was not made a frame ago - see UpdateCollisionPair. */
+    uint64 LastGuardFrame = 0;
+
+    /**
+     * The hand the contact is holding this blade in, in the mesh's space, and whether it is holding one.
+     *
+     * Captured from the animated hand on the frame the animation first brings the blades together, and
+     * let go on the frame the animation would have them apart again - see bHexenCollisionGuardHoldChain.
+     * Local to each machine: it is a pose, not a decision, and it is captured from the same animation
+     * every machine is already playing.
+     */
+    bool bHoldingChain = false;
+    FTransform HeldHandRig = FTransform::Identity;
+
+    /**
+     * The server's throw, as an event rather than as a position.
+     *
+     * A counter with a notify, so two clashes in a row arrive as two events, and the velocity beside it
+     * in the same bunch. One posting per clash: what the blade does afterwards is a decay every machine
+     * can work out on its own, and sending an offset every frame would be the whole of the traffic
+     * problem again for something nobody has to agree about to the millimetre.
+     */
+    UPROPERTY(ReplicatedUsing = OnRep_KnockImpulse)
+    uint8 KnockImpulseSerial = 0;
+
+    UPROPERTY(Replicated)
+    FVector_NetQuantize10 KnockImpulseVelocity;
+
+    UFUNCTION()
+    void OnRep_KnockImpulse();
 
     /** Shared with the rig, which runs on an animation worker thread. */
     mutable FCriticalSection HexenCollisionGuardLock;
@@ -711,6 +946,18 @@ protected:
 
     /** The instance HoldMontage paused - the one ResumePausedMontage gives its blend-in back to. */
     int32 PausedMontageInstanceID = INDEX_NONE;
+
+    /**
+     * The swing instance seen on the previous tick, so that a swing STARTED mid-contact can be noticed.
+     *
+     * The hold used to be taken only on the frame the guard first pushes. Press attack while a bind is
+     * already being held apart and there is no such frame: the guard was pushing last frame too, and the
+     * sweep - the other way a swing is stopped - only runs when the blades were apart last frame, which in
+     * a bind they were not. So the new swing was stopped by nothing at all. On the 10-04 run contacts were
+     * first noticed at a median depth of 12.9 cm and a 90th percentile of 36.8 cm, which is most of the way
+     * through a blade.
+     */
+    int32 LastSeenSwingInstanceID = INDEX_NONE;
 
     /** The volumes currently reporting contact. A set rather than a counter so a repeated report cannot drift the total, which is the failure this component was made to prevent. */
     TSet<TWeakObjectPtr<UHexenCollisionComponent>> ContactingVolumes;
