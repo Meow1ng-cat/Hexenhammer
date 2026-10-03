@@ -68,36 +68,102 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DamageCollision|Debug")
     FColor ContactShapeColor = FColor::Red;
 
-    /** One line per contact with what the energy balance decided. Server-side, since that is where it is decided. */
+    /** One line per contact with what the balance decided. Server-side, since that is where it is decided. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DamageCollision|Debug")
-    bool bLogContactBalance = false;
+    bool bLogContactBalance = true;
 
 
 public:
     UHexenCollisionComponent();
     virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
-    /** How fast the query shape is moving, in cm/s, measured between the last two poses. Zero on volumes that do not track it - see NeedsVelocityTracking. */
+    /** How fast the query shape's centre is moving, in cm/s, measured between the last two poses. Zero on volumes that do not track it - see NeedsVelocityTracking. */
     FVector GetVolumeVelocity() const { return VolumeVelocity; }
 
+    /** How fast the shape is turning, in radians per second about its centre, from the same two poses. */
+    FVector GetVolumeAngularVelocity() const { return VolumeAngularVelocity; }
+
     /**
-     * What this volume brings to a contact - one half of the energy balance that decides which of two
-     * blades gives way.
+     * How fast one particular point of this volume is moving, in cm/s.
      *
-     * Two terms, and the second is the one a purely kinetic comparison was missing: a blade standing
-     * still in a guard has no kinetic energy at all, so it would offer no resistance whatever and every
-     * strike would sail through a stance untouched. The hold term does not depend on motion, so a guard
-     * resists by being held; the kinetic term then adds whatever the blade is actually carrying on top.
+     * The centre's velocity alone cannot say this, and on a swung blade the difference is most of the
+     * answer: the shape turns as much as it travels, so the tip goes several times faster than the
+     * middle and the hilt slower. Which matters because the point a contact wants the speed of is the
+     * point where the blades actually met, not the middle of the capsule.
+     */
+    FVector GetVelocityAtPoint(const FVector& WorldPoint) const;
+
+    /**
+     * The point this volume turns about - the grip of a blade, a joint for a limb.
+     *
+     * A weapon is attached to a hand socket, so the weapon actor's own origin IS the grip, whether or
+     * not the shape is offset from it (BladeSocketName is unset, so it is). Leverage is measured from
+     * here, so getting it from the attachment rather than from the shape is the point: the shape can be
+     * hung anywhere, the hand cannot.
+     */
+    virtual FVector GetPivotWorld() const;
+
+    /**
+     * What this volume resists with at the point it is being pushed - its effective mass there, in kg.
+     * One half of the balance that decides which of two blades gives way.
+     *
+     * Effective mass, and not the kinetic energy this used to compare, because energy cannot express the
+     * thing a bind is actually decided by. A blade turning about its grip carries the SAME energy at
+     * every point along its length: the effective mass at a point falls off as 1/r² exactly as fast as
+     * the speed there grows with r, so ½·m_eff·v² comes out identical whether the blades meet at the
+     * hilt or at the tip. Comparing energies therefore cannot tell a strong part of a blade from a weak
+     * one - it is blind to the question by construction, and no amount of correcting the speed term
+     * fixes that.
+     *
+     * Effective mass is what a collision actually divides by, and leverage falls straight out of it with
+     * no term of its own.
      *
      * Zero on the base, which is the honest answer for a body hitbox: what a struck limb resists with is
      * not modelled yet, and pretending otherwise would put a made-up number into a real balance.
      */
-    virtual float GetContactPush() const { return 0.f; }
+    float GetContactResistance(const FVector& AtWorldPoint) const { return GetContactResistanceAt(GetPivotWorld(), AtWorldPoint); }
 
-    /** This volume's mass. Zero on the base for the same reason GetContactPush() is - a limb's mass is not modelled yet. */
+    /**
+     * The same thing, measured from a pivot handed in rather than from GetPivotWorld().
+     *
+     * The guard works in the animated pose - the one the animation asked for, before anything pushed the
+     * blade anywhere - and the drawn pivot does not belong in that sum: mixing the two would put the
+     * known rig-to-mesh discrepancy straight into the share. So the guard passes the animated hand.
+     */
+    float GetContactResistanceAt(const FVector& PivotWorld, const FVector& AtWorldPoint) const;
+
+    /**
+     * What this volume is made of, as seen from its grip: its moment of inertia about the pivot, in
+     * kg·cm², including whatever a braced hand adds. Independent of where it is being pushed - that is
+     * what the lever arm in GetContactResistanceAt() is for.
+     *
+     * Zero on the base: a limb's is not modelled yet, and a made-up number in a real balance is worse
+     * than an honest nothing.
+     */
+    virtual float GetContactInertia() const { return 0.f; }
+
+    /**
+     * How much of a contact at these two points THIS volume gives way by, against Other, in 0..1.
+     *
+     * Each side's lever is measured to its OWN closest point rather than to one shared point: those are
+     * the two arms the force actually acts on, and near a tip they differ by a radius.
+     *
+     * The two sides' answers add to one, so the pair resolves exactly one overlap between them however
+     * lopsided it is. Half each when there is nothing to go on - a volume with no inertia modelled must
+     * not silently become immovable.
+     */
+    float GetYieldFractionAgainst(const UHexenCollisionComponent* Other, const FVector& MyPivot, const FVector& MyPoint, const FVector& TheirPivot, const FVector& TheirPoint) const;
+
+    /** How close to the pivot a contact is allowed to be reckoned, in cm. Resistance goes as 1/r², so r near zero is a division by nothing - and a blade cannot be touched inside the hand holding it. */
+    static constexpr double MinLeverArm = 5.0;
+
+    /** This volume's mass. Zero on the base for the same reason GetContactResistance() is - a limb's mass is not modelled yet. */
     virtual float GetContactMass() const { return 0.f; }
 
-    /** What the energy balance worked out when the current contact began. Meaningless while nothing is touching. */
+    /** Whether whoever holds this volume is bracing against it right now. For the log: it is the difference between two very different numbers out of GetContactResistance. */
+    virtual bool IsGripBraced() const { return false; }
+
+    /** What the balance worked out when the current contact began. Meaningless while nothing is touching. */
     float GetContactClosingSpeed() const { return ContactClosingSpeed; }
     float GetContactYieldFraction() const { return ContactYieldFraction; }
 
@@ -146,9 +212,10 @@ protected:
      */
     virtual bool NeedsVelocityTracking() const { return false; }
 
-    /** The shape's pose on the previous tick, and the velocity derived from it. */
+    /** The shape's pose on the previous tick, and the motion derived from it - how the centre moved, and how the shape turned. */
     FTransform LastShapeTransform;
     FVector VolumeVelocity = FVector::ZeroVector;
+    FVector VolumeAngularVelocity = FVector::ZeroVector;
 
     /** Bound to CollisionObject's overlap delegates in BeginPlay. */
     UFUNCTION()
@@ -221,7 +288,7 @@ protected:
     FVector_NetQuantize100 ContactPointWorld;
 
     /**
-     * The share of this contact that THIS volume gives way by, from the energy balance, in 0..1.
+     * The share of this contact that THIS volume gives way by, from the balance of effective masses, in 0..1.
      *
      * 1 means being swept aside completely, 0 means not moving at all. Mal pare needs no special case
      * anywhere: a blow far outweighing the other side's hold drives the other side's share towards 1 and
@@ -284,8 +351,8 @@ public:
 
 protected:
 
-    /** Server-side. Fills ContactYieldFraction and ContactClosingSpeed from the two volumes' mass and motion. Runs once, when a contact begins. */
-    void MeasureContactBalance(const UHexenCollisionComponent* OtherVolume);
+    /** Server-side. Fills ContactYieldFraction and ContactClosingSpeed from where the two volumes met and what each has behind it there. Runs once, when a contact begins. */
+    void MeasureContactBalance(const UHexenCollisionComponent* OtherVolume, const FVector& ContactPoint);
 
     UFUNCTION()
     void OnRep_InContact();
@@ -296,10 +363,16 @@ protected:
     /** Tells the fighter's combat component what this volume is currently reporting. The only thing this volume does with its contact state. */
     void ReportContact();
 
-    /** The fighter's combat component, resolved on demand and kept. Null when this volume is not on (or held by) a character carrying one. */
-    UHexenCombatComponent* GetCombatComponent();
+    /**
+     * The fighter's combat component, resolved on demand and kept. Null when this volume is not on (or
+     * held by) a character carrying one.
+     *
+     * const, and the cache is mutable, because the balance asks a volume what it resists with through a
+     * const pointer to it - and that answer depends on who is holding the blade.
+     */
+    UHexenCombatComponent* GetCombatComponent() const;
 
-    TWeakObjectPtr<UHexenCombatComponent> CombatComponent;
+    mutable TWeakObjectPtr<UHexenCombatComponent> CombatComponent;
 
     /** Creates CollisionObject if it's missing or is the wrong shape, then sizes and configures it. Safe to call repeatedly - it does nothing when the existing shape already matches. */
     virtual void EnsureCollisionObject();

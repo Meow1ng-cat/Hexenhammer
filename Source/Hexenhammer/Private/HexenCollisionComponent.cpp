@@ -113,8 +113,62 @@ void UHexenCollisionComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 	}
 
 	const FTransform Current = CollisionObject->GetComponentTransform();
-	VolumeVelocity = (Current.GetLocation() - LastShapeTransform.GetLocation()) / FMath::Max(DeltaTime, KINDA_SMALL_NUMBER);
+	const double SafeDelta = FMath::Max<double>(DeltaTime, KINDA_SMALL_NUMBER);
+	VolumeVelocity = (Current.GetLocation() - LastShapeTransform.GetLocation()) / SafeDelta;
+
+	// How the shape turned, as an axis and an angle over the same step. Needed because a blade is swung,
+	// not carried: without it the tip and the hilt are both reported as moving at the speed of the middle.
+	// The shortest arc, so that a turn of 350 degrees one way is read as 10 degrees the other - which is
+	// what it is.
+	FQuat Turn = Current.GetRotation() * LastShapeTransform.GetRotation().Inverse();
+	Turn.Normalize();
+	Turn.EnforceShortestArcWith(FQuat::Identity);
+	FVector TurnAxis = FVector::ZeroVector;
+	double TurnAngle = 0.0;
+	Turn.ToAxisAndAngle(TurnAxis, TurnAngle);
+	VolumeAngularVelocity = TurnAxis * (TurnAngle / SafeDelta);
+
 	LastShapeTransform = Current;
+}
+
+FVector UHexenCollisionComponent::GetVelocityAtPoint(const FVector& WorldPoint) const
+{
+	// Rigid body, so every point of it moves with the centre plus the turn about the centre. Exact, not
+	// an approximation - a blade does not bend.
+	if (!CollisionObject)
+	{
+		return VolumeVelocity;
+	}
+
+	return VolumeVelocity + FVector::CrossProduct(VolumeAngularVelocity, WorldPoint - CollisionObject->GetComponentLocation());
+}
+
+float UHexenCollisionComponent::GetContactResistanceAt(const FVector& PivotWorld, const FVector& AtWorldPoint) const
+{
+	// A force at r from the pivot turns the volume by r/I, so the mass it behaves as if it had there is
+	// I/r²: enormous near the hand, slight at the tip. This one line is the whole of forte and foible -
+	// there is no separate leverage term anywhere, and none is wanted.
+	const double Lever = FMath::Max(FVector::Dist(PivotWorld, AtWorldPoint), MinLeverArm);
+	return static_cast<float>(double(GetContactInertia()) / (Lever * Lever));
+}
+
+float UHexenCollisionComponent::GetYieldFractionAgainst(const UHexenCollisionComponent* Other, const FVector& MyPivot, const FVector& MyPoint, const FVector& TheirPivot, const FVector& TheirPoint) const
+{
+	const float Mine = GetContactResistanceAt(MyPivot, MyPoint);
+	const float Theirs = Other ? Other->GetContactResistanceAt(TheirPivot, TheirPoint) : 0.f;
+	const float Total = Mine + Theirs;
+
+	// The impulse the two exchange is equal and opposite, and the speed it buys each is that impulse over
+	// its own effective mass - so what each gives way by goes as the OTHER's mass over the two together.
+	return (Total > KINDA_SMALL_NUMBER) ? (Theirs / Total) : 0.5f;
+}
+
+FVector UHexenCollisionComponent::GetPivotWorld() const
+{
+	// The weapon actor is snapped to a hand socket when it is equipped, so its origin is the grip. Taken
+	// from there rather than from the shape because the shape's own offset is a content setting that has
+	// been wrong before, while the hand is where the hand is.
+	return GetOwner() ? GetOwner()->GetActorLocation() : GetComponentLocation();
 }
 
 void UHexenCollisionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -255,9 +309,12 @@ void UHexenCollisionComponent::UpdateContactState()
 
 			ContactPointWorld = Measured;
 			ContactPartnerShape = Shape;
-			// PARKED while the rig is being debugged. It is inert either way - nothing consumes
-			// ContactYieldFraction yet - so it cannot be the cause of anything being seen on screen.
-			//MeasureContactBalance(Cast<UHexenCollisionComponent>(Shape->GetAttachParent()));
+
+			// Once per contact, after the partner shape is pinned - the closing speed is measured along
+			// the way out of that particular shape. Still inert as far as the picture goes: nothing
+			// consumes ContactYieldFraction yet, so this can only add [CONTACT] lines and two replicated
+			// floats, and cannot be the cause of anything seen on screen.
+			MeasureContactBalance(Cast<UHexenCollisionComponent>(Shape->GetAttachParent()), Measured);
 			break;
 		}
 	}
@@ -284,7 +341,7 @@ void UHexenCollisionComponent::OnRep_InContact()
 	ReportContact();
 }
 
-void UHexenCollisionComponent::MeasureContactBalance(const UHexenCollisionComponent* OtherVolume)
+void UHexenCollisionComponent::MeasureContactBalance(const UHexenCollisionComponent* OtherVolume, const FVector& ContactPoint)
 {
 	ContactYieldFraction = 0.f;
 	ContactClosingSpeed = 0.f;
@@ -294,34 +351,76 @@ void UHexenCollisionComponent::MeasureContactBalance(const UHexenCollisionCompon
 		return;
 	}
 
-	// How fast they were coming together, along the line between them. Only the closing part counts:
-	// two blades sliding along one another at speed are not striking each other.
-	const FVector Relative = GetVolumeVelocity() - OtherVolume->GetVolumeVelocity();
-	ContactClosingSpeed = Relative.Size() / 100.f; // cm/s -> m/s
-
-	// The whole model, and it needs no branch anywhere. Each side brings its mass times the square of a
-	// speed - its own, plus the speed a freely swung blade would need to carry the same energy as the
-	// grip holding it. The share each gives way by is the other side's push over the total.
-	//
-	// What falls out for free: a blow far outweighing the other side's hold drives its own share towards
-	// zero and ploughs on through, which is mal pare; two fighters evenly matched get a half each and the
-	// blades hold one another; and a parry swung INTO the strike adds its kinetic term to its hold and
-	// resists harder than merely standing would, so an active defence beats a passive one.
-	const float MyPush = GetContactPush();
-	const float OtherPush = OtherVolume->GetContactPush();
-	const float TotalPush = MyPush + OtherPush;
-
-	if (TotalPush > KINDA_SMALL_NUMBER)
+	// How fast the two were coming together, measured AT THE POINT THEY MET and only along the way out
+	// of one another. Both halves of that matter: the speed of the contact point rather than of the
+	// shape's middle, because a swung blade turns as much as it travels; and only the part along the
+	// normal, because two blades sliding along one another at speed are not striking each other.
+	const FVector Relative = GetVelocityAtPoint(ContactPoint) - OtherVolume->GetVelocityAtPoint(ContactPoint);
+	FVector Normal = FVector::ZeroVector;
+	const bool bHaveNormal = ContactPartnerShape.IsValid() && ComputeSeparationNormalAgainst(ContactPartnerShape.Get(), Normal);
+	if (bHaveNormal)
 	{
-		ContactYieldFraction = OtherPush / TotalPush;
+		// Normal points out of the other shape, so closing shows up as motion against it.
+		ContactClosingSpeed = FMath::Max(0.f, static_cast<float>(-FVector::DotProduct(Relative, Normal))) / 100.f;
+	}
+	else
+	{
+		ContactClosingSpeed = static_cast<float>(Relative.Size()) / 100.f;
+	}
+
+	// Who gives way, and by how much. The impulse two bodies exchange is equal and opposite, and the
+	// speed it buys each of them is that impulse over its own effective mass at the point of contact -
+	// so the share each gives way by is the OTHER side's effective mass over the two together. That is
+	// the whole model, and leverage is inside it rather than beside it: what resists at r from the grip
+	// is I/r², which at 30 cm along a metre of blade is thirteen times what it is at the tip.
+	//
+	// Speed is deliberately absent. In a rigid collision the SHARE does not depend on how fast the two
+	// were going - only on where they met and what stands behind each of them there. Speed says how hard
+	// the clash was, which is ContactClosingSpeed and, later, damage. This is what the energy comparison
+	// that used to stand here got wrong in both directions at once: it let a swing beat a guard for no
+	// reason but being in motion, and it could not tell the strong part of a blade from the weak part at
+	// all, because a turning blade carries the same energy at every point along its length.
+	//
+	// What still falls out for free: two fighters meeting blade-middle to blade-middle get a half each
+	// and bind; catching a cut on the forte against a tip sends the tip away almost untouched, whoever
+	// swung it; and a fighter who is simply stronger holds firmer, through the grip term, on both attack
+	// and defence alike.
+	//
+	// This is the record of the moment they met, replicated and kept for damage. It is NOT what moves the
+	// blades: a bind slides, the levers change with it, and a share fixed at the first frame would be
+	// wrong by the second. The guard works the same sum out live every frame from the animated poses -
+	// see UHexenCombatComponent::UpdateHexenCollisionGuard.
+	const float MyResistance = GetContactResistance(ContactPoint);
+	const float OtherResistance = OtherVolume->GetContactResistance(ContactPoint);
+	const float TotalResistance = MyResistance + OtherResistance;
+
+	if (TotalResistance > KINDA_SMALL_NUMBER)
+	{
+		ContactYieldFraction = OtherResistance / TotalResistance;
+	}
+
+	// And the throw: the same impulse carried on into velocity, so that the blade that loses the balance
+	// is not merely held out of the way but sent out of it, and stays out for a moment afterwards. The
+	// share above decides who gives way while the two are against each other; this decides what the
+	// meeting itself does to them.
+	if (bHaveNormal)
+	{
+		if (UHexenCombatComponent* Fighter = GetFighter())
+		{
+			Fighter->ApplyContactKnock(Normal, ContactClosingSpeed * 100.f, MyResistance, OtherResistance);
+		}
 	}
 
 #if !UE_BUILD_SHIPPING
 	if (bLogContactBalance)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[CONTACT] %s vs %s | closing %.1f m/s | push %.0f vs %.0f | yields %.2f"),
+		UE_LOG(LogTemp, Warning, TEXT("[CONTACT] %s vs %s | closing %.1f m/s | lever %.0f vs %.0f cm | resist %.2f %s vs %.2f %s kg | yields %.2f"),
 			*GetNameSafe(GetOwner()), *GetNameSafe(OtherVolume->GetOwner()),
-			ContactClosingSpeed, MyPush, OtherPush, ContactYieldFraction);
+			ContactClosingSpeed,
+			FVector::Dist(GetPivotWorld(), ContactPoint), FVector::Dist(OtherVolume->GetPivotWorld(), ContactPoint),
+			MyResistance, IsGripBraced() ? TEXT("BRACED") : TEXT("loose"),
+			OtherResistance, OtherVolume->IsGripBraced() ? TEXT("BRACED") : TEXT("loose"),
+			ContactYieldFraction);
 	}
 #endif
 }
@@ -462,7 +561,7 @@ bool UHexenCollisionComponent::ComputeContactPoint(const UPrimitiveComponent* Ot
 	return ComputeAnalyticContact(OtherShape, OutWorldPoint, Normal, Depth);
 }
 
-UHexenCombatComponent* UHexenCollisionComponent::GetCombatComponent()
+UHexenCombatComponent* UHexenCollisionComponent::GetCombatComponent() const
 {
 	if (CombatComponent.IsValid())
 	{

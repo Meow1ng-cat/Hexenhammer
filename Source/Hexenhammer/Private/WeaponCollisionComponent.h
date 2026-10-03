@@ -22,25 +22,37 @@ public:
     float Mass = 1.f;
 
     /**
-     * How firmly this blade is held to the pose the animation wants it in, expressed as the speed a
-     * freely swung blade would need to carry the same energy.
+     * How much the grip adds to what the blade resists with, as a share of the blade's own figure, at
+     * ordinary strength.
      *
-     * Not a defender's property - every blade is always being pulled towards its animated pose, whether
-     * that pose is mid-swing or standing in a guard, so this applies to both sides of a bind. It is what
-     * a guard resists with when the blade is not moving at all, and also what drags a deflected strike
-     * back onto its line.
+     * A blade held firmly cannot turn about its grip freely - it has to drag some of the arm and body
+     * with it, and that is what a guard resists with when it is not moving at all. 1 means an ordinary
+     * fighter's grip doubles the blade; 0 means a blade nobody is really holding, free to be knocked
+     * aside by anything.
      *
-     * A speed rather than an energy so it compares directly against the kinetic term with no conversion,
-     * and so the number means something you can picture: at 10, a fighter holds their blade about as
-     * firmly as a blade swung at 10 m/s pushes.
+     * Not a defender's property: it weighs on whichever side is bracing, attacking or defending alike.
+     * But it only weighs while the fighter IS bracing - a relaxed hand adds nothing, see
+     * AHexenhammerCharacter::bBracing. Strength scales it, through the same factor that scales the
+     * swing's speed, so that a fighter's strength enters attack and defence by exactly the same amount
+     * and two equally strong fighters stay an equal match at any strength.
      *
-     * A placeholder. It will come from the character's Strength once that exists.
+     * Four, so that a braced grip is five times the blade's own figure. One - the first value here - made
+     * a braced blade only twice as hard to move as a relaxed one, which is not mal pare: the shares came
+     * out 0.33 against 0.67, and the fighter who won still gave way by a third of the overlap. Five to one
+     * puts him at a sixth. Physically it is the right order too: the blade's inertia about the grip is
+     * about 0.39 kg m², and two braced arms with some torso behind them are several times that, where a
+     * relaxed wrist is almost nothing.
      */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DamageCollision")
-    float HoldSpeed = 10.f;
+    float GripInertiaShare = 4.f;
 
-    virtual float GetContactPush() const override;
+    virtual float GetContactInertia() const override;
     virtual float GetContactMass() const override { return Mass; }
+    virtual bool IsGripBraced() const override;
+
+protected:
+    /** What the holder's grip puts behind this blade: their strength while bracing, zero while relaxed or when nobody is holding it - see AHexenhammerCharacter::GetGripFactor. */
+    float GetHolderGripFactor() const;
 
 protected:
     /** A blade is the moving half of every clash, so it is the one volume kind that has to know its own speed. */
