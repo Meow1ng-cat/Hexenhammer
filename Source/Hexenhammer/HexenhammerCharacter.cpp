@@ -100,6 +100,55 @@ void AHexenhammerCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(AHexenhammerCharacter, ActiveWeapon);
+	DOREPLIFETIME(AHexenhammerCharacter, Strength);
+	DOREPLIFETIME(AHexenhammerCharacter, bBracing);
+}
+
+void AHexenhammerCharacter::Server_SetBracing_Implementation(bool bNewBracing)
+{
+	// Server RPC body - this only ever runs on the server, no HasAuthority() check needed here.
+	bBracing = bNewBracing;
+}
+
+void AHexenhammerCharacter::SetStrength(int32 NewStrength)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogHexenhammer, Warning, TEXT("SetStrength: %s is not the server's copy of this fighter - strength is the server's to set. Ignored."), *GetName());
+		return;
+	}
+
+	const int32 Clamped = FMath::Max(1, NewStrength);
+	if (Clamped != NewStrength)
+	{
+		// Loudly, not silently: a characteristic of zero or less is a mistake somewhere upstream, and
+		// quietly reading it as one would hide it.
+		UE_LOG(LogHexenhammer, Warning, TEXT("SetStrength: %d is not a characteristic - strength is whole and positive. Using %d on %s."), NewStrength, Clamped, *GetName());
+	}
+
+	Strength = Clamped;
+}
+
+float AHexenhammerCharacter::GetStrengthFactor() const
+{
+	const int32 PointsOverReference = GetStrength() - FMath::Max(1, StrengthReference);
+
+	// Floored above zero rather than at zero: everything downstream multiplies by this, and a factor of
+	// zero would not read as "very weak" anywhere - it would read as a swing that never plays and a
+	// blade with nothing behind it.
+	return FMath::Max(0.01f, 1.f + PointsOverReference * StrengthPerPoint);
+}
+
+float AHexenhammerCharacter::GetAttackPlayRate() const
+{
+	// A rate of zero would stop the swing where it stands and never finish it - and a montage standing
+	// still is exactly what a guard hold looks like, so it would read as the contact mechanic having
+	// seized rather than as a bad number. A negative one would play the swing backwards. Neither is
+	// allowed through, whatever is typed into the limits.
+	const float Floor = FMath::Max(0.01f, MinAttackPlayRate);
+	const float Ceiling = FMath::Max(Floor, MaxAttackPlayRate);
+
+	return FMath::Clamp(GetStrengthFactor(), Floor, Ceiling);
 }
 
 void AHexenhammerCharacter::Move(const FInputActionValue& Value)
